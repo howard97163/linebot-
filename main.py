@@ -64,7 +64,8 @@ COL_CATEGORY    = 15  # 分類
 COL_COST_STRUCT = 16  # 支出成本結構
 COL_MONTH       = 17  # 月份
 COL_RMB         = 18  # 換匯金額
-COL_RAW         = 19  # 原始備註
+COL_EXCHANGE_RATE = 19  # 匯率
+COL_RAW         = 20  # 原始備註
 
 # 應收帳款欄位
 RECV_COL_DATE        = 1
@@ -108,6 +109,26 @@ def today_tw():
 def to_int(s: str) -> int:
     return int(str(s).replace(",", ""))
 
+def parse_optional_transaction_date(text: str):
+    today = today_tw()
+    m = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(.+)$", text)
+    if m:
+        try:
+            tx_date = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+            return tx_date, m.group(4).strip()
+        except ValueError:
+            return None, text
+
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})\s+(.+)$", text)
+    if m:
+        try:
+            tx_date = datetime(today.year, int(m.group(1)), int(m.group(2))).date()
+            return tx_date, m.group(3).strip()
+        except ValueError:
+            return None, text
+
+    return today, text
+
 def has_seen_message(mid):
     return bool(mid and mid in _recent_message_id_set)
 
@@ -141,6 +162,19 @@ CATEGORIES = {
     "燈":"設備","機器":"設備","噴霧":"設備","冰箱":"設備","ro機":"設備",
     "農藥":"農藥肥料","肥料":"農藥肥料",
     "711":"活動銷售","福袋":"活動銷售",
+    # 進出口
+    "檢疫":"進出口費用","關稅":"進出口費用",
+    "罰金":"進出口費用","出口":"進出口費用",
+    "標籤帶":"進出口費用",
+    # 差旅
+    "機票":"差旅費","住宿":"差旅費","計程車":"差旅費",
+    "接機":"差旅費","機加酒":"差旅費",
+    # 餐飲交際
+    "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
+    # 平台費用
+    "手續費":"平台費用","服務費":"平台費用",
+    # 損耗退貨
+    "退錢":"損耗退貨","退款":"損耗退貨",
 }
 
 COST_STRUCTURE_MAP = {
@@ -148,6 +182,9 @@ COST_STRUCTURE_MAP = {
     "運費":"物流費用","材料耗材":"耗材費用",
     "水電費":"水電費","租金":"租金","薪資":"人事費用",
     "換匯":"換匯","設備":"設備投資","農藥肥料":"農藥肥料",
+    "進出口費用":"進出口費用","差旅費":"差旅費",
+    "餐飲交際":"餐飲交際","平台費用":"平台費用",
+    "損耗退貨":"損耗退貨",
 }
 
 CHANNELS = {
@@ -199,6 +236,10 @@ def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
 # ══════════════════════════════════════════════════════════════
 def parse_message(text: str) -> dict | None:
     text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
+    tx_date, text = parse_optional_transaction_date(text)
+    if tx_date is None:
+        return None
+
     if text.startswith("+"):
         text = f"{TX_INCOME} " + text[1:].strip()
     elif text.startswith("-"):
@@ -227,9 +268,12 @@ def parse_message(text: str) -> dict | None:
         remaining = re.sub(r'進價\s*\d[\d,]*', '', remaining).strip()
 
     rmb = ""
+    exchange_rate = ""
     rm = re.search(r'(\d[\d,]*)\s*rmb|rmb\s*(\d[\d,]*)|人民幣\s*(\d[\d,]*)', remaining, re.IGNORECASE)
     if rm:
-        rmb = next(g for g in rm.groups() if g)
+        rmb = to_int(next(g for g in rm.groups() if g))
+        if rmb > 0:
+            exchange_rate = round(amount / rmb, 2)
 
     item = remaining
     customer = ""
@@ -242,17 +286,16 @@ def parse_message(text: str) -> dict | None:
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
         gross_profit = amount - (cost_per_unit * qty)
 
-    today    = today_tw()
     category = guess_category(f"{item} {text}")
 
     return {
-        "date":           today.strftime("%Y/%m/%d"),
+        "date":           tx_date.strftime("%Y/%m/%d"),
         "type":           tx_type,
         "amount":         amount,
         "item":           item,
         "customer":       customer,
         "status":         status,
-        "pay_date":       today.strftime("%Y/%m/%d") if status in PAID_STATUSES else "",
+        "pay_date":       tx_date.strftime("%Y/%m/%d") if status in PAID_STATUSES else "",
         "qty":            qty,
         "unit_price":     unit_price,
         "cost_per_unit":  cost_per_unit,
@@ -262,8 +305,9 @@ def parse_message(text: str) -> dict | None:
         "note":           "",
         "category":       category,
         "cost_structure": guess_cost_structure(category, tx_type),
-        "month":          f"{today.month}月",
+        "month":          f"{tx_date.month}月",
         "rmb":            rmb,
+        "exchange_rate":  exchange_rate,
         "raw":            text,
     }
 
@@ -418,7 +462,7 @@ def append_transaction(wb, data: dict) -> int:
         data["qty"], data["unit_price"], data["cost_per_unit"],
         data["gross_profit"], data["channel"], data["days_to_collect"],
         data["note"], data["category"], data["cost_structure"],
-        data["month"], data["rmb"], data["raw"],
+        data["month"], data["rmb"], data["exchange_rate"], data["raw"],
     ]
     response = sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
     m = re.search(r"![A-Z]+(\d+)(?::[A-Z]+\d+)?$",
@@ -483,6 +527,8 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool) -> 
         lines.append(f"成本｜{data['cost_structure']}")
     if data["rmb"]:
         lines.append(f"換匯｜RMB {data['rmb']}")
+    if data["exchange_rate"]:
+        lines.append(f"匯率｜{data['exchange_rate']}")
     lines.append("─" * 22)
     if recv_added:
         lines.append("📌 已同步到應收帳款")
@@ -519,14 +565,23 @@ HELP_TEXT = """🌿 溫室帳目機器人
 📥 新增交易：
 收入 金額 品項 客戶
 支出 金額 品項
+日期 收入 金額 品項 客戶
+日期 支出 金額 品項
 
 📌 新增範例：
 收入 50000 珍妮500顆 李淵男
 支出 18000 大陸運費
+2026/05/29 收入 20000 鹿角蕨40顆 姜孟學 未付
+5/29 支出 400 測試 姜孟學 已付
 收入 32000 爆米花1000顆 美琪 未付
 +50000 侏儒黃月1000顆 吳政翰
 -4200 淘寶悶箱
 收入 50000 珍妮500顆 李淵男 進價30
+支出 18114 換人民幣4000 黃浩
+
+💡 未輸入日期時，會預設為今天。
+   已收/已付會把付款日期預設為交易日期。
+   有輸入 RMB/人民幣金額時，會自動計算匯率。
 
 🔄 更新付款狀態：
 更新 行號 狀態
