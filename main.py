@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import calendar
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -109,25 +110,91 @@ def today_tw():
 def to_int(s: str) -> int:
     return int(str(s).replace(",", ""))
 
+def parse_date_value(value: str, default_year: int | None = None):
+    value = value.strip()
+    m = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", value)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+        except ValueError:
+            return None
+
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})$", value)
+    if m and default_year is not None:
+        try:
+            return datetime(default_year, int(m.group(1)), int(m.group(2))).date()
+        except ValueError:
+            return None
+
+    return None
+
 def parse_optional_transaction_date(text: str):
     today = today_tw()
     m = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(.+)$", text)
     if m:
-        try:
-            tx_date = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
-            return tx_date, m.group(4).strip()
-        except ValueError:
+        tx_date = parse_date_value(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
+        if tx_date is None:
             return None, text
+        return tx_date, m.group(4).strip()
 
     m = re.match(r"^(\d{1,2})[/-](\d{1,2})\s+(.+)$", text)
     if m:
-        try:
-            tx_date = datetime(today.year, int(m.group(1)), int(m.group(2))).date()
-            return tx_date, m.group(3).strip()
-        except ValueError:
+        tx_date = parse_date_value(f"{m.group(1)}/{m.group(2)}", today.year)
+        if tx_date is None:
             return None, text
+        return tx_date, m.group(3).strip()
 
     return today, text
+
+def add_months(d, months: int = 1):
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return datetime(year, month, day).date()
+
+def extract_due_date(text: str, tx_date):
+    pattern = r"(?:付款期限|期限|到期日|到期)\s*[:：]?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2})"
+    m = re.search(pattern, text)
+    if not m:
+        return add_months(tx_date, 1), text
+
+    due_date = parse_date_value(m.group(1), tx_date.year)
+    if due_date is None:
+        return None, text
+
+    text = (text[:m.start()] + text[m.end():]).strip()
+    text = re.sub(r"\s+", " ", text)
+    return due_date, text
+
+def calculate_overdue_days(due_date, outstanding: int):
+    if not due_date or outstanding <= 0:
+        return ""
+    days = (today_tw() - due_date).days
+    return days if days > 0 else ""
+
+def overdue_background_color(overdue_days):
+    if not overdue_days:
+        return None
+    if overdue_days > 90:
+        return {"red": 1.0, "green": 0.80, "blue": 0.80}
+    if overdue_days > 60:
+        return {"red": 1.0, "green": 0.88, "blue": 0.70}
+    if overdue_days > 30:
+        return {"red": 1.0, "green": 0.96, "blue": 0.65}
+    return None
+
+def apply_receivable_overdue_format(sheet, row_num: int, overdue_days):
+    color = overdue_background_color(overdue_days)
+    if not color:
+        return
+    sheet.format(f"A{row_num}:I{row_num}", {"backgroundColor": color})
+
+def clear_receivable_overdue_format(sheet, row_num: int):
+    sheet.format(
+        f"A{row_num}:I{row_num}",
+        {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+    )
 
 def has_seen_message(mid):
     return bool(mid and mid in _recent_message_id_set)
@@ -255,9 +322,24 @@ def parse_message(text: str) -> dict | None:
     if amount <= 0 or not remaining:
         return None
 
+    due_date, remaining = extract_due_date(remaining, tx_date)
+    if due_date is None:
+        return None
+
+    initial_collected = 0
+    partial_match = re.search(rf"\s+(?:{STATUS_PARTIAL}|部分付款)\s+([\d,]+)$", remaining)
+    if partial_match:
+        initial_collected = to_int(partial_match.group(1))
+        if initial_collected <= 0 or initial_collected >= amount:
+            return None
+        status = STATUS_PARTIAL
+        remaining = remaining[:partial_match.start()].strip()
+    else:
+        status = None
+
     status_pat = "|".join(map(re.escape, STATUS_VALUES))
-    sm = re.search(rf"\s+({status_pat})$", remaining)
-    status    = sm.group(1) if sm else (STATUS_UNPAID if tx_type == TX_INCOME else STATUS_PAID)
+    sm = re.search(rf"\s+({status_pat})$", remaining) if status is None else None
+    status = status or (sm.group(1) if sm else (STATUS_UNPAID if tx_type == TX_INCOME else STATUS_PAID))
     if sm:
         remaining = remaining[:sm.start()].strip()
 
@@ -286,6 +368,8 @@ def parse_message(text: str) -> dict | None:
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
         gross_profit = amount - (cost_per_unit * qty)
 
+    outstanding = amount - initial_collected if status == STATUS_PARTIAL else amount
+    overdue_days = calculate_overdue_days(due_date, outstanding) if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else ""
     category = guess_category(f"{item} {text}")
 
     return {
@@ -296,6 +380,10 @@ def parse_message(text: str) -> dict | None:
         "customer":       customer,
         "status":         status,
         "pay_date":       tx_date.strftime("%Y/%m/%d") if status in PAID_STATUSES else "",
+        "due_date":       due_date.strftime("%Y/%m/%d") if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else "",
+        "initial_collected": initial_collected,
+        "outstanding":    outstanding,
+        "overdue_days":   overdue_days,
         "qty":            qty,
         "unit_price":     unit_price,
         "cost_per_unit":  cost_per_unit,
@@ -419,20 +507,31 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         recv_row = find_receivable_row(all_recv, row_num, customer, item, total_amount)
 
         if tx_type == TX_INCOME and recv_row:
+            recv_data = all_recv[recv_row - 1] if len(all_recv) >= recv_row else []
+            due_date_str = recv_data[RECV_COL_DUE - 1] if len(recv_data) >= RECV_COL_DUE else ""
+            due_date = parse_date_value(due_date_str) if due_date_str else None
             if new_status == STATUS_COLLECTED:
                 # 全額已收
                 recv_sheet.batch_update([
                     {"range": f"E{recv_row}", "values": [[total_amount]]},
                     {"range": f"F{recv_row}", "values": [[0]]},
+                    {"range": f"H{recv_row}", "values": [[""]]},
                 ])
+                clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
             elif new_status == STATUS_PARTIAL:
                 # 部分收款
                 outstanding = total_amount - collected
+                overdue_days = calculate_overdue_days(due_date, outstanding)
                 recv_sheet.batch_update([
                     {"range": f"E{recv_row}", "values": [[collected]]},
                     {"range": f"F{recv_row}", "values": [[outstanding]]},
+                    {"range": f"H{recv_row}", "values": [[overdue_days]]},
                 ])
+                if overdue_days:
+                    apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
+                else:
+                    clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
     except Exception:
         logger.exception("Failed to update receivables during status update")
@@ -487,10 +586,12 @@ def update_receivables(wb, data: dict, row_num: int) -> bool:
 
     sheet.insert_row(
         [data["date"], data["customer"], data["item"],
-         data["amount"], 0, data["amount"], "", "", receivable_note(data["raw"], row_num)],
+         data["amount"], data["initial_collected"], data["outstanding"],
+         data["due_date"], data["overdue_days"], receivable_note(data["raw"], row_num)],
         insert_at,
         value_input_option="RAW",
     )
+    apply_receivable_overdue_format(sheet, insert_at, data["overdue_days"])
     return True
 
 # ══════════════════════════════════════════════════════════════
@@ -529,6 +630,13 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool) -> 
         lines.append(f"換匯｜RMB {data['rmb']}")
     if data["exchange_rate"]:
         lines.append(f"匯率｜{data['exchange_rate']}")
+    if data["due_date"]:
+        lines.append(f"付款期限｜{data['due_date']}")
+    if data["initial_collected"]:
+        lines.append(f"已收｜NT$ {data['initial_collected']:,}")
+        lines.append(f"未收｜NT$ {data['outstanding']:,}")
+    if data["overdue_days"]:
+        lines.append(f"逾期｜{data['overdue_days']} 天")
     lines.append("─" * 22)
     if recv_added:
         lines.append("📌 已同步到應收帳款")
@@ -574,6 +682,8 @@ HELP_TEXT = """🌿 溫室帳目機器人
 2026/05/29 收入 20000 鹿角蕨40顆 姜孟學 未付
 5/29 支出 400 測試 姜孟學 已付
 收入 32000 爆米花1000顆 美琪 未付
+收入 50000 珍妮500顆 李淵男 未付 期限7/15
+收入 50000 珍妮500顆 李淵男 部分收 30000
 +50000 侏儒黃月1000顆 吳政翰
 -4200 淘寶悶箱
 收入 50000 珍妮500顆 李淵男 進價30
@@ -582,6 +692,8 @@ HELP_TEXT = """🌿 溫室帳目機器人
 💡 未輸入日期時，會預設為今天。
    已收/已付會把付款日期預設為交易日期。
    有輸入 RMB/人民幣金額時，會自動計算匯率。
+   未付/部分收會寫入應收帳款；未輸入期限時，預設交易日起 1 個月。
+   逾期超過 30/60/90 天會標示黃/橘/紅色。
 
 🔄 更新付款狀態：
 更新 行號 狀態
