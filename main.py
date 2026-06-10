@@ -30,6 +30,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 SPREADSHEET_ID            = os.environ["SPREADSHEET_ID"]
 GOOGLE_CREDS_JSON         = os.environ["GOOGLE_CREDENTIALS_JSON"]
 APP_TIMEZONE              = os.environ.get("APP_TIMEZONE", "Asia/Taipei")
+CRON_SECRET               = os.environ.get("CRON_SECRET", "")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -83,6 +84,10 @@ RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
 MIN_TRANSACTION_ROW = 3
+TX_LAST_COL = COL_RAW
+RECV_LAST_COL = RECV_COL_NOTE
+ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
 
 # ══════════════════════════════════════════════════════════════
 # Google Sheets 連線
@@ -190,11 +195,128 @@ def apply_receivable_overdue_format(sheet, row_num: int, overdue_days):
         return
     sheet.format(f"A{row_num}:I{row_num}", {"backgroundColor": color})
 
+def alternating_color_for_row(row_num: int):
+    return ROW_COLOR_GREEN if (row_num - MIN_TRANSACTION_ROW) % 2 else ROW_COLOR_WHITE
+
 def clear_receivable_overdue_format(sheet, row_num: int):
     sheet.format(
         f"A{row_num}:I{row_num}",
-        {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+        {"backgroundColor": alternating_color_for_row(row_num)},
     )
+
+def last_data_row(values: list[list[str]], date_col: int = 1) -> int:
+    last_row = 0
+    for i, row in enumerate(values, start=1):
+        if i < MIN_TRANSACTION_ROW:
+            continue
+        date_value = row[date_col - 1] if len(row) >= date_col else ""
+        if parse_date_value(str(date_value)):
+            last_row = i
+    return last_row
+
+def sort_sheet_by_date(sheet, last_col: int):
+    values = sheet.get_all_values()
+    end_row = last_data_row(values)
+    if end_row <= MIN_TRANSACTION_ROW:
+        return
+    sheet.spreadsheet.batch_update({
+        "requests": [{
+            "sortRange": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": MIN_TRANSACTION_ROW - 1,
+                    "endRowIndex": end_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": last_col,
+                },
+                "sortSpecs": [{
+                    "dimensionIndex": COL_DATE - 1,
+                    "sortOrder": "ASCENDING",
+                }],
+            }
+        }]
+    })
+
+def apply_alternating_row_colors(sheet, last_col: int):
+    values = sheet.get_all_values()
+    end_row = last_data_row(values)
+    if end_row < MIN_TRANSACTION_ROW:
+        return
+
+    requests = []
+    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
+        color = alternating_color_for_row(row_num)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": row_num - 1,
+                    "endRowIndex": row_num,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": last_col,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color,
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    if requests:
+        sheet.spreadsheet.batch_update({"requests": requests})
+
+def refresh_receivable_overdue_formats(sheet):
+    apply_alternating_row_colors(sheet, RECV_LAST_COL)
+    values = sheet.get_all_values()
+    for row_num in range(MIN_TRANSACTION_ROW, last_data_row(values) + 1):
+        row = values[row_num - 1] if len(values) >= row_num else []
+        outstanding = 0
+        due_date = None
+        try:
+            outstanding = to_int(row[RECV_COL_OUTSTANDING - 1]) if len(row) >= RECV_COL_OUTSTANDING and row[RECV_COL_OUTSTANDING - 1] else 0
+        except ValueError:
+            outstanding = 0
+        if len(row) >= RECV_COL_DUE and row[RECV_COL_DUE - 1]:
+            due_date = parse_date_value(row[RECV_COL_DUE - 1])
+        overdue_days = calculate_overdue_days(due_date, outstanding)
+        if overdue_days:
+            sheet.update_cell(row_num, RECV_COL_OVERDUE, overdue_days)
+            apply_receivable_overdue_format(sheet, row_num, overdue_days)
+        else:
+            clear_receivable_overdue_format(sheet, row_num)
+
+def find_transaction_row(sheet, data: dict) -> int:
+    values = sheet.get_all_values()
+    candidates = []
+    for row_num in range(MIN_TRANSACTION_ROW, last_data_row(values) + 1):
+        row = values[row_num - 1] if len(values) >= row_num else []
+        row_date = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+        row_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
+        row_amount = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else ""
+        row_item = row[COL_ITEM - 1] if len(row) >= COL_ITEM else ""
+        row_customer = row[COL_CUSTOMER - 1] if len(row) >= COL_CUSTOMER else ""
+        row_raw = row[COL_RAW - 1] if len(row) >= COL_RAW else ""
+        try:
+            amount_matches = to_int(row_amount) == data["amount"]
+        except ValueError:
+            amount_matches = False
+        if (
+            row_date == data["date"]
+            and row_type == data["type"]
+            and amount_matches
+            and row_item == data["item"]
+            and row_customer == data["customer"]
+            and row_raw == data["raw"]
+        ):
+            candidates.append(row_num)
+    return candidates[-1] if candidates else 0
+
+def organize_transaction_sheet(sheet, data: dict) -> int:
+    sort_sheet_by_date(sheet, TX_LAST_COL)
+    apply_alternating_row_colors(sheet, TX_LAST_COL)
+    return find_transaction_row(sheet, data)
 
 def has_seen_message(mid):
     return bool(mid and mid in _recent_message_id_set)
@@ -426,8 +548,9 @@ def parse_update_command(text: str) -> dict | None:
 def receivable_note(raw: str, row_num: int) -> str:
     return f"[交易行號:{row_num}] {raw}".strip()
 
-def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, item: str, amount: int) -> int | None:
+def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, item: str, amount: int, raw: str = "") -> int | None:
     marker = f"[交易行號:{row_num}]"
+    raw_matches = []
     fallback_matches = []
     for i, r in enumerate(all_recv, start=1):
         if i < MIN_TRANSACTION_ROW:
@@ -436,6 +559,8 @@ def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, 
         note = r[RECV_COL_NOTE - 1] if len(r) >= RECV_COL_NOTE else ""
         if marker in note:
             return i
+        if raw and raw in note:
+            raw_matches.append(i)
 
         r_customer = r[RECV_COL_CUSTOMER - 1] if len(r) >= RECV_COL_CUSTOMER else ""
         r_item     = r[RECV_COL_ITEM - 1]     if len(r) >= RECV_COL_ITEM     else ""
@@ -447,6 +572,8 @@ def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, 
         if r_customer == customer and r_item == item and same_amount:
             fallback_matches.append(i)
 
+    if len(raw_matches) == 1:
+        return raw_matches[0]
     return fallback_matches[0] if len(fallback_matches) == 1 else None
 
 # ══════════════════════════════════════════════════════════════
@@ -467,6 +594,7 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
     item     = row_data[COL_ITEM - 1]     if len(row_data) >= COL_ITEM     else ""
     customer = row_data[COL_CUSTOMER - 1] if len(row_data) >= COL_CUSTOMER else ""
     amount_str = row_data[COL_AMOUNT - 1] if len(row_data) >= COL_AMOUNT   else "0"
+    raw = row_data[COL_RAW - 1] if len(row_data) >= COL_RAW else ""
     try:
         total_amount = to_int(amount_str) if amount_str else 0
     except ValueError:
@@ -504,7 +632,7 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
     try:
         recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
         all_recv   = recv_sheet.get_all_values()
-        recv_row = find_receivable_row(all_recv, row_num, customer, item, total_amount)
+        recv_row = find_receivable_row(all_recv, row_num, customer, item, total_amount, raw)
 
         if tx_type == TX_INCOME and recv_row:
             recv_data = all_recv[recv_row - 1] if len(all_recv) >= recv_row else []
@@ -516,6 +644,7 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
                     {"range": f"E{recv_row}", "values": [[total_amount]]},
                     {"range": f"F{recv_row}", "values": [[0]]},
                     {"range": f"H{recv_row}", "values": [[""]]},
+                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
                 ])
                 clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
@@ -527,12 +656,14 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
                     {"range": f"E{recv_row}", "values": [[collected]]},
                     {"range": f"F{recv_row}", "values": [[outstanding]]},
                     {"range": f"H{recv_row}", "values": [[overdue_days]]},
+                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
                 ])
                 if overdue_days:
                     apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
                 else:
                     clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
+        refresh_receivable_overdue_formats(recv_sheet)
     except Exception:
         logger.exception("Failed to update receivables during status update")
 
@@ -563,10 +694,9 @@ def append_transaction(wb, data: dict) -> int:
         data["note"], data["category"], data["cost_structure"],
         data["month"], data["rmb"], data["exchange_rate"], data["raw"],
     ]
-    response = sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-    m = re.search(r"![A-Z]+(\d+)(?::[A-Z]+\d+)?$",
-                  response.get("updates", {}).get("updatedRange", ""))
-    return int(m.group(1)) if m else len(sheet.col_values(1))
+    sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+    sorted_row_num = organize_transaction_sheet(sheet, data)
+    return sorted_row_num if sorted_row_num else len(sheet.col_values(1))
 
 def update_receivables(wb, data: dict, row_num: int) -> bool:
     if data["type"] != TX_INCOME:
@@ -591,7 +721,8 @@ def update_receivables(wb, data: dict, row_num: int) -> bool:
         insert_at,
         value_input_option="RAW",
     )
-    apply_receivable_overdue_format(sheet, insert_at, data["overdue_days"])
+    sort_sheet_by_date(sheet, RECV_LAST_COL)
+    refresh_receivable_overdue_formats(sheet)
     return True
 
 # ══════════════════════════════════════════════════════════════
@@ -709,7 +840,20 @@ HELP_TEXT = """🌿 溫室帳目機器人
 📌 未付/部分收收入會自動
    同步到「應收帳款」分頁
 
+🕛 應收帳款整理：
+整理應收
+會重新計算逾期天數與警示顏色
+
 輸入「說明」再次查看"""
+
+def refresh_receivables_job() -> dict:
+    wb = get_workbook()
+    sheet = wb.worksheet(SHEET_RECEIVABLES)
+    refresh_receivable_overdue_formats(sheet)
+    return {
+        "ok": True,
+        "date": today_tw().strftime("%Y/%m/%d"),
+    }
 
 # ══════════════════════════════════════════════════════════════
 # Flask 路由
@@ -724,6 +868,29 @@ def callback():
         abort(400)
     return "OK"
 
+@app.route("/refresh-receivables", methods=["POST", "GET"])
+def refresh_receivables_route():
+    expected_secret = CRON_SECRET
+    provided_secret = (
+        request.headers.get("X-Cron-Secret")
+        or request.args.get("secret")
+        or ""
+    )
+    if expected_secret and provided_secret != expected_secret:
+        abort(403)
+    if not expected_secret:
+        logger.warning("CRON_SECRET is not set; /refresh-receivables is unprotected")
+
+    try:
+        result = refresh_receivables_job()
+        return {
+            "status": "ok",
+            "date": result["date"],
+        }
+    except Exception:
+        logger.exception("Scheduled receivables refresh failed")
+        return {"status": "error"}, 500
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_text   = event.message.text.strip()
@@ -736,6 +903,15 @@ def handle_message(event):
         # ── 說明指令 ───────────────────────────────────────────
         if user_text in ("說明", "help", "Help", "HELP", "?", "？"):
             reply = HELP_TEXT
+
+        # ── 手動刷新應收帳款 ───────────────────────────────────
+        elif user_text == "整理應收":
+            try:
+                result = refresh_receivables_job()
+                reply = f"✅ 應收帳款已刷新\n日期｜{result['date']}"
+            except Exception:
+                logger.exception("Manual receivables refresh failed")
+                reply = "⚠️ 整理應收失敗，請稍後再試。"
 
         # ── 更新付款狀態 ────────────────────────────────────────
         elif user_text.startswith("更新"):
