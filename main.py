@@ -37,6 +37,7 @@ handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
 SHEET_TRANSACTIONS = "📋 交易記錄"
 SHEET_RECEIVABLES  = "💰 應收帳款"
+SHEET_CUSTOMER_ANALYSIS = "👥 客戶分析"
 
 TX_INCOME   = "收入"
 TX_EXPENSE  = "支出"
@@ -102,6 +103,15 @@ def get_workbook():
         json.loads(GOOGLE_CREDS_JSON), scopes=scopes
     )
     return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+
+def worksheet_by_names(wb, *names):
+    last_error = None
+    for name in names:
+        try:
+            return wb.worksheet(name)
+        except Exception as e:
+            last_error = e
+    raise last_error
 
 def get_app_timezone():
     try:
@@ -545,6 +555,12 @@ def parse_update_command(text: str) -> dict | None:
         "collected": collected,
     }
 
+def parse_delete_command(text: str) -> dict | None:
+    m = re.match(r"^刪除(?:交易(?:紀錄|記錄)?)?\s+(\d+)$", text.strip())
+    if not m:
+        return None
+    return {"row": int(m.group(1))}
+
 def receivable_note(raw: str, row_num: int) -> str:
     return f"[交易行號:{row_num}] {raw}".strip()
 
@@ -681,6 +697,62 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         "total_amount": amount_str,
     }
 
+def apply_delete_transaction(wb, row_num: int) -> dict:
+    if row_num < MIN_TRANSACTION_ROW:
+        return {"ok": False, "error": "請確認行號是否為交易資料列"}
+
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    row_data = tx_sheet.row_values(row_num)
+    if not row_data or len(row_data) < COL_AMOUNT:
+        return {"ok": False, "error": f"找不到第 {row_num} 行，請確認行號是否正確"}
+
+    tx_type = row_data[COL_TYPE - 1] if len(row_data) >= COL_TYPE else ""
+    item = row_data[COL_ITEM - 1] if len(row_data) >= COL_ITEM else ""
+    customer = row_data[COL_CUSTOMER - 1] if len(row_data) >= COL_CUSTOMER else ""
+    amount_str = row_data[COL_AMOUNT - 1] if len(row_data) >= COL_AMOUNT else "0"
+    raw = row_data[COL_RAW - 1] if len(row_data) >= COL_RAW else ""
+    try:
+        amount = to_int(amount_str) if amount_str else 0
+    except ValueError:
+        return {"ok": False, "error": "此列金額格式不正確，請先檢查試算表"}
+
+    if tx_type not in (TX_INCOME, TX_EXPENSE):
+        return {"ok": False, "error": "此列不是有效的交易資料列"}
+
+    recv_deleted = False
+    recv_row = None
+    if tx_type == TX_INCOME:
+        try:
+            recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
+            all_recv = recv_sheet.get_all_values()
+            recv_row = find_receivable_row(all_recv, row_num, customer, item, amount, raw)
+            if recv_row:
+                recv_sheet.delete_rows(recv_row)
+                recv_deleted = True
+        except Exception:
+            logger.exception("Failed to delete related receivable")
+            return {"ok": False, "error": "找到交易資料，但刪除對應應收帳款時失敗，請稍後再試"}
+
+    tx_sheet.delete_rows(row_num)
+    sort_sheet_by_date(tx_sheet, TX_LAST_COL)
+    apply_alternating_row_colors(tx_sheet, TX_LAST_COL)
+    if tx_type == TX_INCOME:
+        try:
+            refresh_receivable_overdue_formats(wb.worksheet(SHEET_RECEIVABLES))
+        except Exception:
+            logger.exception("Failed to refresh receivables after deletion")
+
+    return {
+        "ok": True,
+        "row_num": row_num,
+        "type": tx_type,
+        "item": item,
+        "customer": customer,
+        "amount": amount,
+        "recv_deleted": recv_deleted,
+        "recv_row": recv_row,
+    }
+
 # ══════════════════════════════════════════════════════════════
 # 寫入新交易
 # ══════════════════════════════════════════════════════════════
@@ -725,10 +797,37 @@ def update_receivables(wb, data: dict, row_num: int) -> bool:
     refresh_receivable_overdue_formats(sheet)
     return True
 
+def update_customer_analysis(wb, data: dict) -> bool:
+    if data["type"] != TX_INCOME:
+        return False
+
+    customer = data["customer"].strip()
+    if not customer:
+        return False
+
+    sheet = worksheet_by_names(wb, SHEET_CUSTOMER_ANALYSIS, "客戶分析")
+    customer_names = sheet.col_values(1)
+    existing_names = {
+        name.strip()
+        for name in customer_names[MIN_TRANSACTION_ROW - 1:]
+        if name and name.strip()
+    }
+    if customer in existing_names:
+        return False
+
+    target_row = len(customer_names) + 1
+    for row_num in range(MIN_TRANSACTION_ROW, len(customer_names) + 1):
+        if not customer_names[row_num - 1].strip():
+            target_row = row_num
+            break
+
+    sheet.update_cell(target_row, 1, customer)
+    return True
+
 # ══════════════════════════════════════════════════════════════
 # 回覆格式
 # ══════════════════════════════════════════════════════════════
-def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool) -> str:
+def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool, customer_added: bool = False) -> str:
     icon        = "💰" if data["type"] == TX_INCOME else "💸"
     status_icon = {"已收":"✅","已付":"✅","未付":"⏳","部分收":"⚠️"}.get(data["status"], "")
     lines = [
@@ -771,6 +870,8 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool) -> 
     lines.append("─" * 22)
     if recv_added:
         lines.append("📌 已同步到應收帳款")
+    if customer_added:
+        lines.append("👥 已新增到客戶分析")
     lines.append("✏️ 更新付款狀態請輸入：")
     lines.append(f"更新 {row_num} 已收")
     return "\n".join(lines)
@@ -797,6 +898,20 @@ def format_update_reply(result: dict) -> str:
         lines.append("📌 應收帳款已同步更新")
     elif result.get("type") == TX_INCOME:
         lines.append("⚠️ 應收帳款請手動確認")
+    return "\n".join(lines)
+
+def format_delete_reply(result: dict) -> str:
+    lines = [
+        f"🗑️ 已刪除第 {result['row_num']} 行交易",
+        "─" * 22,
+        f"類型｜{result['type']}",
+        f"金額｜NT$ {result['amount']:,}",
+        f"品項｜{result['item']}",
+    ]
+    if result["customer"]:
+        lines.append(f"客戶｜{result['customer']}")
+    if result["recv_deleted"]:
+        lines.append("📌 對應應收帳款已一併刪除")
     return "\n".join(lines)
 
 HELP_TEXT = """🌿 溫室帳目機器人
@@ -834,11 +949,16 @@ HELP_TEXT = """🌿 溫室帳目機器人
 更新 21 已付
 更新 21 部分收 30000
 
+🗑️ 刪除交易：
+刪除 25
+刪除交易 25
+
 💡 付款狀態：
 已收 / 已付 / 未付 / 部分收
 
 📌 未付/部分收收入會自動
    同步到「應收帳款」分頁
+   收入交易的新客戶會自動加入「客戶分析」
 
 🕛 應收帳款整理：
 整理應收
@@ -940,6 +1060,26 @@ def handle_message(event):
                     logger.exception("Update failed")
                     reply = "⚠️ 更新失敗，請稍後再試。"
 
+        # ── 刪除交易紀錄 ────────────────────────────────────────
+        elif user_text.startswith("刪除"):
+            delete_cmd = parse_delete_command(user_text)
+            if delete_cmd is None:
+                reply = (
+                    "❌ 刪除格式錯誤\n\n"
+                    "正確格式：\n"
+                    "刪除 行號\n"
+                    "刪除交易 行號\n\n"
+                    "範例：刪除 25"
+                )
+            else:
+                try:
+                    wb = get_workbook()
+                    result = apply_delete_transaction(wb, delete_cmd["row"])
+                    reply = format_delete_reply(result) if result["ok"] else f"❌ {result['error']}"
+                except Exception:
+                    logger.exception("Delete failed")
+                    reply = "⚠️ 刪除失敗，請稍後再試。"
+
         # ── 新增交易（防重複） ──────────────────────────────────
         elif has_seen_message(message_id):
             reply = "這則訊息已經處理過，沒有重複寫入。"
@@ -964,15 +1104,24 @@ def handle_message(event):
                 else:
                     recv_added = False
                     recv_err   = False
+                    customer_added = False
+                    customer_err = False
                     try:
                         recv_added = update_receivables(wb, parsed, row_num)
                     except Exception:
                         recv_err = True
                         logger.exception("Failed to update receivables")
+                    try:
+                        customer_added = update_customer_analysis(wb, parsed)
+                    except Exception:
+                        customer_err = True
+                        logger.exception("Failed to update customer analysis")
 
-                    reply = format_new_transaction_reply(parsed, row_num, recv_added)
+                    reply = format_new_transaction_reply(parsed, row_num, recv_added, customer_added)
                     if recv_err:
                         reply += "\n⚠️ 交易已記錄，但應收帳款同步失敗。"
+                    if customer_err:
+                        reply += "\n⚠️ 交易已記錄，但客戶分析同步失敗。"
 
         line_api.reply_message(
             ReplyMessageRequest(
