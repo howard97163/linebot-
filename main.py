@@ -81,6 +81,14 @@ RECV_COL_DUE         = 7
 RECV_COL_OVERDUE     = 8
 RECV_COL_NOTE        = 9
 
+# 客戶分析欄位
+CUST_COL_NAME        = 1
+CUST_COL_TOTAL       = 2
+CUST_COL_COLLECTED   = 3
+CUST_COL_OUTSTANDING = 4
+CUST_COL_COUNT       = 5
+CUST_COL_RECENT      = 6
+
 RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
@@ -123,7 +131,11 @@ def today_tw():
     return datetime.now(get_app_timezone()).date()
 
 def to_int(s: str) -> int:
-    return int(str(s).replace(",", ""))
+    cleaned = str(s).strip().replace(",", "").replace("NT$", "").replace("$", "")
+    cleaned = re.sub(r"[^\d.-]", "", cleaned)
+    if cleaned in ("", "-", ".", "-."):
+        raise ValueError(f"Invalid number: {s}")
+    return int(round(float(cleaned)))
 
 def parse_date_value(value: str, default_year: int | None = None):
     value = value.strip()
@@ -214,6 +226,25 @@ def clear_receivable_overdue_format(sheet, row_num: int):
         {"backgroundColor": alternating_color_for_row(row_num)},
     )
 
+def find_total_row(values: list[list[str]]) -> int | None:
+    for i, row in enumerate(values, start=1):
+        if row and "合計" in str(row[0]):
+            return i
+    return None
+
+def refresh_receivable_totals(sheet):
+    values = sheet.get_all_values()
+    total_row = find_total_row(values)
+    if not total_row or total_row <= MIN_TRANSACTION_ROW:
+        return
+
+    last_detail_row = total_row - 1
+    sheet.batch_update([
+        {"range": f"D{total_row}", "values": [[f"=SUM(D{MIN_TRANSACTION_ROW}:D{last_detail_row})"]]},
+        {"range": f"E{total_row}", "values": [[f"=SUM(E{MIN_TRANSACTION_ROW}:E{last_detail_row})"]]},
+        {"range": f"F{total_row}", "values": [[f"=SUM(F{MIN_TRANSACTION_ROW}:F{last_detail_row})"]]},
+    ], value_input_option="USER_ENTERED")
+
 def last_data_row(values: list[list[str]], date_col: int = 1) -> int:
     last_row = 0
     for i, row in enumerate(values, start=1):
@@ -253,6 +284,12 @@ def apply_alternating_row_colors(sheet, last_col: int):
     if end_row < MIN_TRANSACTION_ROW:
         return
 
+    apply_alternating_row_colors_to(sheet, last_col, end_row)
+
+def apply_alternating_row_colors_to(sheet, last_col: int, end_row: int):
+    if end_row < MIN_TRANSACTION_ROW:
+        return
+
     requests = []
     for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
         color = alternating_color_for_row(row_num)
@@ -280,7 +317,11 @@ def apply_alternating_row_colors(sheet, last_col: int):
 def refresh_receivable_overdue_formats(sheet):
     apply_alternating_row_colors(sheet, RECV_LAST_COL)
     values = sheet.get_all_values()
-    for row_num in range(MIN_TRANSACTION_ROW, last_data_row(values) + 1):
+    end_row = last_data_row(values)
+    total_row = find_total_row(values)
+    if total_row:
+        end_row = min(end_row, total_row - 1)
+    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
         row = values[row_num - 1] if len(values) >= row_num else []
         outstanding = 0
         due_date = None
@@ -296,6 +337,7 @@ def refresh_receivable_overdue_formats(sheet):
             apply_receivable_overdue_format(sheet, row_num, overdue_days)
         else:
             clear_receivable_overdue_format(sheet, row_num)
+    refresh_receivable_totals(sheet)
 
 def find_transaction_row(sheet, data: dict) -> int:
     values = sheet.get_all_values()
@@ -682,6 +724,11 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         refresh_receivable_overdue_formats(recv_sheet)
     except Exception:
         logger.exception("Failed to update receivables during status update")
+    if tx_type == TX_INCOME:
+        try:
+            refresh_customer_analysis(wb)
+        except Exception:
+            logger.exception("Failed to refresh customer analysis during status update")
 
     return {
         "ok":           True,
@@ -741,6 +788,10 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
             refresh_receivable_overdue_formats(wb.worksheet(SHEET_RECEIVABLES))
         except Exception:
             logger.exception("Failed to refresh receivables after deletion")
+        try:
+            refresh_customer_analysis(wb)
+        except Exception:
+            logger.exception("Failed to refresh customer analysis after deletion")
 
     return {
         "ok": True,
@@ -797,32 +848,108 @@ def update_receivables(wb, data: dict, row_num: int) -> bool:
     refresh_receivable_overdue_formats(sheet)
     return True
 
-def update_customer_analysis(wb, data: dict) -> bool:
-    if data["type"] != TX_INCOME:
-        return False
+def customer_analysis_stats(wb) -> dict:
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    tx_values = tx_sheet.get_all_values()
+    stats = {}
 
-    customer = data["customer"].strip()
-    if not customer:
-        return False
+    for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
+        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
+        if tx_type != TX_INCOME:
+            continue
 
+        customer = row[COL_CUSTOMER - 1].strip() if len(row) >= COL_CUSTOMER and row[COL_CUSTOMER - 1] else ""
+        if not customer:
+            continue
+
+        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else "0"
+        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+        try:
+            amount = to_int(amount_text)
+        except ValueError:
+            amount = 0
+
+        tx_date = parse_date_value(date_text) if date_text else None
+        entry = stats.setdefault(customer, {
+            "total": 0,
+            "outstanding": 0,
+            "count": 0,
+            "recent": None,
+        })
+        entry["total"] += amount
+        entry["count"] += 1
+        if tx_date and (entry["recent"] is None or tx_date > entry["recent"]):
+            entry["recent"] = tx_date
+
+    try:
+        recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
+        recv_values = recv_sheet.get_all_values()
+        total_row = find_total_row(recv_values)
+        end_index = (total_row - 1) if total_row else len(recv_values)
+        for row in recv_values[MIN_TRANSACTION_ROW - 1:end_index]:
+            customer = row[RECV_COL_CUSTOMER - 1].strip() if len(row) >= RECV_COL_CUSTOMER and row[RECV_COL_CUSTOMER - 1] else ""
+            if not customer:
+                continue
+            outstanding_text = row[RECV_COL_OUTSTANDING - 1] if len(row) >= RECV_COL_OUTSTANDING else "0"
+            try:
+                outstanding = to_int(outstanding_text) if outstanding_text else 0
+            except ValueError:
+                outstanding = 0
+            entry = stats.setdefault(customer, {
+                "total": 0,
+                "outstanding": 0,
+                "count": 0,
+                "recent": None,
+            })
+            entry["outstanding"] += outstanding
+    except Exception:
+        logger.exception("Failed to read receivables while building customer analysis")
+
+    return stats
+
+def refresh_customer_analysis(wb) -> bool:
     sheet = worksheet_by_names(wb, SHEET_CUSTOMER_ANALYSIS, "客戶分析")
-    customer_names = sheet.col_values(1)
-    existing_names = {
-        name.strip()
-        for name in customer_names[MIN_TRANSACTION_ROW - 1:]
-        if name and name.strip()
-    }
-    if customer in existing_names:
-        return False
+    values = sheet.get_all_values()
+    stats = customer_analysis_stats(wb)
 
-    target_row = len(customer_names) + 1
-    for row_num in range(MIN_TRANSACTION_ROW, len(customer_names) + 1):
-        if not customer_names[row_num - 1].strip():
-            target_row = row_num
-            break
+    existing_names = []
+    for row in values[MIN_TRANSACTION_ROW - 1:]:
+        name = row[CUST_COL_NAME - 1].strip() if len(row) >= CUST_COL_NAME and row[CUST_COL_NAME - 1] else ""
+        if name and name not in existing_names:
+            existing_names.append(name)
 
-    sheet.update_cell(target_row, 1, customer)
+    all_names = existing_names[:]
+    for name in sorted(stats.keys()):
+        if name not in all_names:
+            all_names.append(name)
+
+    old_row_count = max(len(values), MIN_TRANSACTION_ROW - 1)
+    if old_row_count >= MIN_TRANSACTION_ROW:
+        sheet.batch_clear([f"A{MIN_TRANSACTION_ROW}:F{old_row_count}"])
+
+    rows = []
+    for name in all_names:
+        entry = stats.get(name, {
+            "total": 0,
+            "outstanding": 0,
+            "count": 0,
+            "recent": None,
+        })
+        total = entry["total"]
+        outstanding = entry["outstanding"]
+        collected = max(total - outstanding, 0)
+        recent = entry["recent"].strftime("%Y/%m/%d") if entry["recent"] else ""
+        rows.append([name, total, collected, outstanding, entry["count"], recent])
+
+    if rows:
+        sheet.update(f"A{MIN_TRANSACTION_ROW}:F{MIN_TRANSACTION_ROW + len(rows) - 1}", rows, value_input_option="RAW")
+        apply_alternating_row_colors_to(sheet, CUST_COL_RECENT, MIN_TRANSACTION_ROW + len(rows) - 1)
     return True
+
+def update_customer_analysis(wb, data: dict | None = None) -> bool:
+    if data is not None and data["type"] != TX_INCOME:
+        return False
+    return refresh_customer_analysis(wb)
 
 # ══════════════════════════════════════════════════════════════
 # 回覆格式
@@ -914,62 +1041,84 @@ def format_delete_reply(result: dict) -> str:
         lines.append("📌 對應應收帳款已一併刪除")
     return "\n".join(lines)
 
-HELP_TEXT = """🌿 溫室帳目機器人
+HELP_TEXT = """溫室帳目機器人
 
-📥 新增交易：
-收入 金額 品項 客戶
-支出 金額 品項
-日期 收入 金額 品項 客戶
-日期 支出 金額 品項
+【紀錄收入】
+基本格式：
+收入 金額 品項 客戶 [付款狀態] [期限日期] [進價]
 
-📌 新增範例：
+可用簡寫：
++金額 品項 客戶 [付款狀態]
+
+收入範例：
 收入 50000 珍妮500顆 李淵男
-支出 18000 大陸運費
-2026/05/29 收入 20000 鹿角蕨40顆 姜孟學 未付
-5/29 支出 400 測試 姜孟學 已付
 收入 32000 爆米花1000顆 美琪 未付
+收入 50000 珍妮500顆 李淵男 已收
 收入 50000 珍妮500顆 李淵男 未付 期限7/15
 收入 50000 珍妮500顆 李淵男 部分收 30000
-+50000 侏儒黃月1000顆 吳政翰
--4200 淘寶悶箱
 收入 50000 珍妮500顆 李淵男 進價30
++50000 侏儒黃月1000顆 吳政翰
+
+【紀錄支出】
+基本格式：
+支出 金額 品項 [對象/備註] [付款狀態]
+
+可用簡寫：
+-金額 品項 [對象/備註]
+
+支出範例：
+支出 18000 大陸運費
+支出 400 測試 姜孟學 已付
 支出 18114 換人民幣4000 黃浩
+-4200 淘寶悶箱
 
-💡 未輸入日期時，會預設為今天。
-   已收/已付會把付款日期預設為交易日期。
-   有輸入 RMB/人民幣金額時，會自動計算匯率。
-   未付/部分收會寫入應收帳款；未輸入期限時，預設交易日起 1 個月。
-   逾期超過 30/60/90 天會標示黃/橘/紅色。
+【補登以前日期】
+日期可放在最前面：
+2026/05/29 收入 20000 鹿角蕨40顆 姜孟學 未付
+2026-05-29 支出 400 測試 姜孟學 已付
+5/29 收入 20000 鹿角蕨40顆 姜孟學
+5-29 支出 400 測試
 
-🔄 更新付款狀態：
-更新 行號 狀態
+【可選欄位說明】
+付款狀態：已收 / 已付 / 未付 / 部分收
+期限日期：期限7/15 或 付款期限2026/07/15
+部分收款：部分收 30000
+進價：進價30
+外匯：人民幣4000 / RMB4000 / 4000 RMB
 
-📌 更新範例：
+【自動規則】
+未輸入日期：預設今天
+收入未輸入狀態：預設未付
+支出未輸入狀態：預設已付
+已收/已付：付款日期預設為交易日期
+未付/部分收收入：自動同步應收帳款
+收入的新客戶：自動加入客戶分析
+
+【更新付款狀態】
+更新 行號 已收
+更新 行號 已付
+更新 行號 部分收 金額
+
+更新範例：
 更新 21 已收
 更新 21 已付
 更新 21 部分收 30000
 
-🗑️ 刪除交易：
+【刪除交易】
+刪除 行號
+刪除交易 行號
+刪除交易紀錄 行號
+
+刪除範例：
 刪除 25
 刪除交易 25
-
-💡 付款狀態：
-已收 / 已付 / 未付 / 部分收
-
-📌 未付/部分收收入會自動
-   同步到「應收帳款」分頁
-   收入交易的新客戶會自動加入「客戶分析」
-
-🕛 應收帳款整理：
-整理應收
-會重新計算逾期天數與警示顏色
-
-輸入「說明」再次查看"""
+刪除交易紀錄 25"""
 
 def refresh_receivables_job() -> dict:
     wb = get_workbook()
     sheet = wb.worksheet(SHEET_RECEIVABLES)
     refresh_receivable_overdue_formats(sheet)
+    refresh_customer_analysis(wb)
     return {
         "ok": True,
         "date": today_tw().strftime("%Y/%m/%d"),
@@ -1025,13 +1174,13 @@ def handle_message(event):
             reply = HELP_TEXT
 
         # ── 手動刷新應收帳款 ───────────────────────────────────
-        elif user_text == "整理應收":
+        elif user_text == "整理":
             try:
                 result = refresh_receivables_job()
-                reply = f"✅ 應收帳款已刷新\n日期｜{result['date']}"
+                reply = f"✅ 帳款與客戶分析已整理\n日期｜{result['date']}"
             except Exception:
                 logger.exception("Manual receivables refresh failed")
-                reply = "⚠️ 整理應收失敗，請稍後再試。"
+                reply = "⚠️ 整理失敗，請稍後再試。"
 
         # ── 更新付款狀態 ────────────────────────────────────────
         elif user_text.startswith("更新"):
