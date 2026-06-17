@@ -331,6 +331,15 @@ def refresh_receivable_overdue_formats(sheet):
             outstanding = 0
         if len(row) >= RECV_COL_DUE and row[RECV_COL_DUE - 1]:
             due_date = parse_date_value(row[RECV_COL_DUE - 1])
+        if outstanding <= 0:
+            existing_overdue = row[RECV_COL_OVERDUE - 1] if len(row) >= RECV_COL_OVERDUE else ""
+            try:
+                existing_overdue_days = to_int(existing_overdue) if existing_overdue else ""
+            except ValueError:
+                existing_overdue_days = ""
+            if existing_overdue_days:
+                apply_receivable_overdue_format(sheet, row_num, existing_overdue_days)
+            continue
         overdue_days = calculate_overdue_days(due_date, outstanding)
         if overdue_days:
             sheet.update_cell(row_num, RECV_COL_OVERDUE, overdue_days)
@@ -393,39 +402,76 @@ CATEGORIES = {
     "粉斑":"種苗銷售","豆豆龍":"種苗銷售","nano":"種苗銷售",
     "omg":"種苗銷售","delta":"種苗銷售","戰鬥機":"種苗銷售",
     "種苗":"種苗銷售","植物":"種苗銷售",
-    "運費":"運費","空軍":"運費","黑貓":"運費","郵局":"運費",
-    "水苔":"材料耗材","紙箱":"材料耗材","膠膜":"材料耗材",
-    "悶箱":"材料耗材","棉花":"材料耗材","垃圾袋":"材料耗材",
-    "土":"材料耗材","盆":"材料耗材","木板":"材料耗材",
+    # 物流/包材
+    "運費":"一般運費","空軍":"空軍物流","黑貓":"黑貓宅配","郵局":"郵局寄送",
+    "宅配":"宅配","貨運":"貨運","冷藏":"冷藏配送",
+    "水苔":"水苔","紙箱":"紙箱","膠膜":"膠膜","膠帶":"膠帶",
+    "氣泡布":"氣泡布","保麗龍":"保麗龍","紙板":"紙板","包材":"包材",
+    "悶箱":"悶箱","棉花":"棉花","垃圾袋":"垃圾袋",
+    "土":"介質土","盆":"盆器","木板":"木板",
     "電費":"水電費","水電":"水電費",
     "租金":"租金","薪水":"薪資","薪資":"薪資",
-    "換人民幣":"換匯","換rmb":"換匯","匯款":"換匯","人民幣":"換匯",
-    "燈":"設備","機器":"設備","噴霧":"設備","冰箱":"設備","ro機":"設備",
-    "農藥":"農藥肥料","肥料":"農藥肥料",
-    "711":"活動銷售","福袋":"活動銷售",
+    "工讀":"工讀","臨時工":"臨時工","獎金":"獎金","加班":"加班",
+    "換人民幣":"人民幣換匯","換rmb":"人民幣換匯","匯款":"匯款","人民幣":"人民幣換匯",
+    "燈":"燈具設備","機器":"機器設備","噴霧":"噴霧設備","冰箱":"冰箱設備","ro機":"RO設備",
+    "維修":"設備維修","修理":"設備維修","零件":"設備零件",
+    "馬達":"馬達","風扇":"風扇","水泵":"水泵","噴頭":"噴頭","管線":"管線",
+    "農藥":"農藥","肥料":"肥料",
+    "711":"7-11活動","福袋":"福袋活動",
     # 進出口
-    "檢疫":"進出口費用","關稅":"進出口費用",
-    "罰金":"進出口費用","出口":"進出口費用",
-    "標籤帶":"進出口費用",
+    "檢疫":"檢疫","關稅":"關稅",
+    "罰金":"罰金","出口":"出口費用",
+    "標籤帶":"標籤帶",
     # 差旅
-    "機票":"差旅費","住宿":"差旅費","計程車":"差旅費",
-    "接機":"差旅費","機加酒":"差旅費",
+    "機票":"機票","住宿":"住宿","計程車":"計程車",
+    "接機":"接機","機加酒":"機加酒",
     # 餐飲交際
-    "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
+    "晚餐":"晚餐","尾牙":"尾牙","吃飯":"吃飯",
     # 平台費用
-    "手續費":"平台費用","服務費":"平台費用",
+    "蝦皮手續費":"蝦皮手續費","手續費":"手續費","服務費":"服務費",
+    "刷卡":"刷卡費","金流":"金流費","平台抽成":"平台抽成",
     # 損耗退貨
-    "退錢":"損耗退貨","退款":"損耗退貨",
+    "退錢":"退款","退款":"退款",
+    # 行銷廣告
+    "廣告":"廣告","投放":"廣告投放","拍攝":"拍攝","設計":"設計",
+    "印刷":"印刷","名片":"名片",
+    # 銀行財務
+    "轉帳費":"轉帳費","匯費":"匯費","銀行手續費":"銀行手續費","利息":"利息",
+    # 稅務規費
+    "營業稅":"營業稅","所得稅":"所得稅","規費":"規費","牌照":"牌照",
+    # 場地活動
+    "攤位":"攤位費","市集":"市集活動","展覽":"展覽","報名費":"報名費",
 }
 
 COST_STRUCTURE_MAP = {
     "種苗銷售":"進貨成本","進貨":"進貨成本",
-    "運費":"物流費用","材料耗材":"耗材費用",
+    "一般運費":"物流費用","空軍物流":"物流費用","黑貓宅配":"物流費用",
+    "郵局寄送":"物流費用","宅配":"物流費用","貨運":"物流費用","冷藏配送":"物流費用",
+    "水苔":"耗材費用","紙箱":"耗材費用","膠膜":"耗材費用","膠帶":"耗材費用",
+    "氣泡布":"耗材費用","保麗龍":"耗材費用","紙板":"耗材費用","包材":"耗材費用",
+    "悶箱":"耗材費用","棉花":"耗材費用","垃圾袋":"耗材費用",
+    "介質土":"耗材費用","盆器":"耗材費用","木板":"耗材費用",
     "水電費":"水電費","租金":"租金","薪資":"人事費用",
-    "換匯":"換匯","設備":"設備投資","農藥肥料":"農藥肥料",
-    "進出口費用":"進出口費用","差旅費":"差旅費",
-    "餐飲交際":"餐飲交際","平台費用":"平台費用",
-    "損耗退貨":"損耗退貨",
+    "工讀":"人事費用","臨時工":"人事費用","獎金":"人事費用","加班":"人事費用",
+    "人民幣換匯":"換匯","匯款":"換匯",
+    "燈具設備":"設備投資","機器設備":"設備投資","噴霧設備":"設備投資",
+    "冰箱設備":"設備投資","RO設備":"設備投資",
+    "設備維修":"設備維修","設備零件":"設備維修","馬達":"設備維修",
+    "風扇":"設備維修","水泵":"設備維修","噴頭":"設備維修","管線":"設備維修",
+    "農藥":"農藥肥料","肥料":"農藥肥料",
+    "7-11活動":"活動銷售","福袋活動":"活動銷售",
+    "檢疫":"進出口費用","關稅":"進出口費用","罰金":"進出口費用",
+    "出口費用":"進出口費用","標籤帶":"進出口費用",
+    "機票":"差旅費","住宿":"差旅費","計程車":"差旅費","接機":"差旅費","機加酒":"差旅費",
+    "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
+    "蝦皮手續費":"平台費用","手續費":"平台費用","服務費":"平台費用",
+    "刷卡費":"平台費用","金流費":"平台費用","平台抽成":"平台費用",
+    "退款":"損耗退貨",
+    "廣告":"行銷廣告","廣告投放":"行銷廣告","拍攝":"行銷廣告",
+    "設計":"行銷廣告","印刷":"行銷廣告","名片":"行銷廣告",
+    "轉帳費":"銀行費用","匯費":"銀行費用","銀行手續費":"銀行費用","利息":"銀行費用",
+    "營業稅":"稅務規費","所得稅":"稅務規費","規費":"稅務規費","牌照":"稅務規費",
+    "攤位費":"活動費用","市集活動":"活動費用","展覽":"活動費用","報名費":"活動費用",
 }
 
 CHANNELS = {
@@ -662,9 +708,7 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         return {"ok": False, "error": "此列不是有效的交易資料列"}
     if new_status == STATUS_PARTIAL:
         if collected is None or collected <= 0:
-            return {"ok": False, "error": "部分收必須填寫已收金額"}
-        if collected >= total_amount:
-            return {"ok": False, "error": "部分收金額需小於交易金額；若已全收請用「已收」"}
+            return {"ok": False, "error": "部分收必須填寫本次收到的金額"}
 
     today    = today_tw()
     pay_date = today.strftime("%Y/%m/%d")
@@ -687,6 +731,8 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
 
     # 同步應收帳款
     recv_updated = False
+    total_collected = collected
+    outstanding = ""
     try:
         recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
         all_recv   = recv_sheet.get_all_values()
@@ -701,25 +747,48 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
                 recv_sheet.batch_update([
                     {"range": f"E{recv_row}", "values": [[total_amount]]},
                     {"range": f"F{recv_row}", "values": [[0]]},
-                    {"range": f"H{recv_row}", "values": [[""]]},
                     {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
                 ])
-                clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
             elif new_status == STATUS_PARTIAL:
-                # 部分收款
-                outstanding = total_amount - collected
-                overdue_days = calculate_overdue_days(due_date, outstanding)
-                recv_sheet.batch_update([
-                    {"range": f"E{recv_row}", "values": [[collected]]},
-                    {"range": f"F{recv_row}", "values": [[outstanding]]},
-                    {"range": f"H{recv_row}", "values": [[overdue_days]]},
-                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
-                ])
-                if overdue_days:
-                    apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
+                # 部分收款：輸入金額視為「本次收款」，需累加到既有已收金額。
+                previous_collected_text = recv_data[RECV_COL_COLLECTED - 1] if len(recv_data) >= RECV_COL_COLLECTED else "0"
+                try:
+                    previous_collected = to_int(previous_collected_text) if previous_collected_text else 0
+                except ValueError:
+                    previous_collected = 0
+                total_collected = previous_collected + collected
+                if total_collected >= total_amount:
+                    total_collected = total_amount
+                    outstanding = 0
+                    new_status = STATUS_COLLECTED
+                    days_to_collect = ""
+                    if orig_date_str:
+                        try:
+                            orig = datetime.strptime(orig_date_str, "%Y/%m/%d").date()
+                            days_to_collect = (today - orig).days
+                        except ValueError:
+                            pass
+                    tx_sheet.batch_update([
+                        {"range": f"F{row_num}", "values": [[new_status]]},
+                        {"range": f"M{row_num}", "values": [[days_to_collect]]},
+                    ])
                 else:
-                    clear_receivable_overdue_format(recv_sheet, recv_row)
+                    outstanding = total_amount - total_collected
+                overdue_days = calculate_overdue_days(due_date, outstanding)
+                receivable_updates = [
+                    {"range": f"E{recv_row}", "values": [[total_collected]]},
+                    {"range": f"F{recv_row}", "values": [[outstanding]]},
+                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
+                ]
+                if outstanding > 0:
+                    receivable_updates.append({"range": f"H{recv_row}", "values": [[overdue_days]]})
+                recv_sheet.batch_update(receivable_updates)
+                if outstanding > 0:
+                    if overdue_days:
+                        apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
+                    else:
+                        clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
         refresh_receivable_overdue_formats(recv_sheet)
     except Exception:
@@ -740,7 +809,9 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         "pay_date":     pay_date,
         "days":         days_to_collect,
         "recv_updated": recv_updated,
-        "collected":    collected,
+        "collected":    total_collected,
+        "received_now": collected,
+        "outstanding":  outstanding,
         "total_amount": amount_str,
     }
 
@@ -1016,8 +1087,12 @@ def format_update_reply(result: dict) -> str:
         f"狀態｜{status_icon} {result['new_status']}",
         f"付款日｜{result['pay_date']}",
     ]
-    if result["new_status"] == STATUS_PARTIAL and result["collected"]:
-        lines.append(f"已收｜NT$ {result['collected']:,} / NT$ {result['total_amount']}")
+    if result["received_now"]:
+        lines.append(f"本次收款｜NT$ {result['received_now']:,}")
+    if result["collected"]:
+        lines.append(f"累計已收｜NT$ {result['collected']:,} / NT$ {result['total_amount']}")
+    if result["outstanding"] != "":
+        lines.append(f"未收餘額｜NT$ {result['outstanding']:,}")
     if result["days"] != "":
         lines.append(f"收款天數｜{result['days']} 天")
     lines.append("─" * 22)
@@ -1097,12 +1172,13 @@ HELP_TEXT = """溫室帳目機器人
 【更新付款狀態】
 更新 行號 已收
 更新 行號 已付
-更新 行號 部分收 金額
+更新 行號 部分收 本次收款金額
 
 更新範例：
 更新 21 已收
 更新 21 已付
 更新 21 部分收 30000
+部分收會累加到既有已收金額；累計達全額時會自動結清
 
 【刪除交易】
 刪除 行號
