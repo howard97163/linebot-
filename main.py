@@ -518,6 +518,21 @@ def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
         return qty, (round(amount / qty) if qty > 0 else 0)
     return 0, 0
 
+def extract_labeled_customer(text: str) -> tuple[str, str]:
+    m = re.search(r"\s+(?:客戶|廠商|供應商|對象)\s*[:：]\s*(.+)$", text)
+    if not m:
+        return text, ""
+    customer = m.group(1).strip()
+    text = text[:m.start()].strip()
+    return text, customer
+
+def clean_item_text(text: str) -> str:
+    text = re.sub(r'(\d[\d,]*)\s*rmb|rmb\s*(\d[\d,]*)|人民幣\s*(\d[\d,]*)', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?:total|總額)\s*[:：]?\s*\d[\d,]*', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?:進價|單價|一袋成本|成本)\s*\d[\d,]*', ' ', text)
+    text = re.sub(r'\d[\d,]*\s*[顆盒個株袋]', ' ', text)
+    return re.sub(r"\s+", " ", text).strip()
+
 # ══════════════════════════════════════════════════════════════
 # 新增交易：解析訊息
 # ══════════════════════════════════════════════════════════════
@@ -563,6 +578,8 @@ def parse_message(text: str) -> dict | None:
     if sm:
         remaining = remaining[:sm.start()].strip()
 
+    remaining, customer = extract_labeled_customer(remaining)
+
     cost_per_unit = 0
     cm = re.search(r'進價\s*(\d[\d,]*)', remaining)
     if cm:
@@ -577,12 +594,14 @@ def parse_message(text: str) -> dict | None:
         if rmb > 0:
             exchange_rate = round(amount / rmb, 2)
 
-    item = remaining
-    customer = ""
-    if tx_type == TX_INCOME and " " in remaining:
-        item, customer = [p.strip() for p in remaining.rsplit(" ", 1)]
+    qty, unit_price = extract_qty_and_unit_price(remaining, amount)
 
-    qty, unit_price = extract_qty_and_unit_price(item, amount)
+    item = clean_item_text(remaining)
+    has_detail_parts = bool(cost_per_unit or rmb or qty)
+    if not customer and " " in item and (tx_type == TX_INCOME or has_detail_parts):
+        item, customer = [p.strip() for p in item.rsplit(" ", 1)]
+    if not item:
+        return None
 
     gross_profit = ""
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
