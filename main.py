@@ -58,17 +58,18 @@ COL_STATUS      = 6   # 付款狀態
 COL_PAY_DATE    = 7   # 付款日期
 COL_QTY         = 8   # 數量
 COL_UNIT_PRICE  = 9   # 售出單價
-COL_COST        = 10  # 進貨單價
-COL_PROFIT      = 11  # 毛利
-COL_CHANNEL     = 12  # 銷售管道
-COL_DAYS        = 13  # 收款天數
-COL_NOTE        = 14  # 備註
-COL_CATEGORY    = 15  # 分類
-COL_COST_STRUCT = 16  # 支出成本結構
-COL_MONTH       = 17  # 月份
-COL_RMB         = 18  # 換匯金額
-COL_EXCHANGE_RATE = 19  # 匯率
-COL_RAW         = 20  # 原始備註
+COL_WHOLESALE_PRICE = 10  # 售出批發價
+COL_COST        = 11  # 進貨單價
+COL_PROFIT      = 12  # 毛利
+COL_CHANNEL     = 13  # 銷售管道
+COL_DAYS        = 14  # 收款天數
+COL_NOTE        = 15  # 備註
+COL_CATEGORY    = 16  # 分類
+COL_COST_STRUCT = 17  # 支出成本結構
+COL_MONTH       = 18  # 月份
+COL_RMB         = 19  # 換匯金額
+COL_EXCHANGE_RATE = 20  # 匯率
+COL_RAW         = 21  # 原始備註
 
 # 應收帳款欄位
 RECV_COL_DATE        = 1
@@ -97,6 +98,7 @@ TX_LAST_COL = COL_RAW
 RECV_LAST_COL = RECV_COL_NOTE
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
+NUMBER_PATTERN = r"\d[\d,]*(?:\.\d+)?"
 
 # ══════════════════════════════════════════════════════════════
 # Google Sheets 連線
@@ -136,6 +138,14 @@ def to_int(s: str) -> int:
     if cleaned in ("", "-", ".", "-."):
         raise ValueError(f"Invalid number: {s}")
     return int(round(float(cleaned)))
+
+def to_number(s: str):
+    cleaned = str(s).strip().replace(",", "").replace("NT$", "").replace("$", "")
+    cleaned = re.sub(r"[^\d.-]", "", cleaned)
+    if cleaned in ("", "-", ".", "-."):
+        raise ValueError(f"Invalid number: {s}")
+    value = float(cleaned)
+    return int(value) if value.is_integer() else value
 
 def parse_date_value(value: str, default_year: int | None = None):
     value = value.strip()
@@ -505,13 +515,13 @@ def guess_cost_structure(category: str, tx_type: str) -> str:
     return COST_STRUCTURE_MAP.get(category, "其他費用")
 
 def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
-    m = re.search(r'\$(\d[\d,]*)\s*[*×x]\s*(\d[\d,]*)', item)
+    m = re.search(rf'\$({NUMBER_PATTERN})\s*[*×x]\s*(\d[\d,]*)', item)
     if m:
-        return to_int(m.group(2)), to_int(m.group(1))
-    m = re.search(r'(\d[\d,]*)\s*[*×x]\s*\$?(\d[\d,]*)', item)
+        return to_int(m.group(2)), to_number(m.group(1))
+    m = re.search(rf'(\d[\d,]*)\s*[*×x]\s*\$?({NUMBER_PATTERN})', item)
     if m:
         qty = to_int(m.group(1))
-        return qty, to_int(m.group(2))
+        return qty, to_number(m.group(2))
     m = re.search(r'(\d[\d,]*)\s*[顆盒個株]', item)
     if m:
         qty = to_int(m.group(1))
@@ -526,10 +536,20 @@ def extract_labeled_customer(text: str) -> tuple[str, str]:
     text = text[:m.start()].strip()
     return text, customer
 
+def extract_wholesale_price(text: str) -> tuple[str, float | int | str]:
+    pattern = rf"(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*({NUMBER_PATTERN})"
+    m = re.search(pattern, text)
+    if not m:
+        return text, ""
+    wholesale_price = to_number(m.group(1))
+    text = (text[:m.start()] + " " + text[m.end():]).strip()
+    return re.sub(r"\s+", " ", text), wholesale_price
+
 def clean_item_text(text: str) -> str:
     text = re.sub(r'(\d[\d,]*)\s*rmb|rmb\s*(\d[\d,]*)|人民幣\s*(\d[\d,]*)', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(r'(?:total|總額)\s*[:：]?\s*\d[\d,]*', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(r'(?:進價|單價|一袋成本|成本)\s*\d[\d,]*', ' ', text)
+    text = re.sub(rf'(?:total|總額)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(rf'(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text)
+    text = re.sub(rf'(?:進價|單價|一袋成本|成本)\s*{NUMBER_PATTERN}', ' ', text)
     text = re.sub(r'\d[\d,]*\s*[顆盒個株袋]', ' ', text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -578,13 +598,14 @@ def parse_message(text: str) -> dict | None:
     if sm:
         remaining = remaining[:sm.start()].strip()
 
+    remaining, wholesale_price = extract_wholesale_price(remaining)
     remaining, customer = extract_labeled_customer(remaining)
 
     cost_per_unit = 0
-    cm = re.search(r'進價\s*(\d[\d,]*)', remaining)
+    cm = re.search(rf'進價\s*({NUMBER_PATTERN})', remaining)
     if cm:
-        cost_per_unit = to_int(cm.group(1))
-        remaining = re.sub(r'進價\s*\d[\d,]*', '', remaining).strip()
+        cost_per_unit = to_number(cm.group(1))
+        remaining = re.sub(rf'進價\s*{NUMBER_PATTERN}', '', remaining).strip()
 
     rmb = ""
     exchange_rate = ""
@@ -597,7 +618,7 @@ def parse_message(text: str) -> dict | None:
     qty, unit_price = extract_qty_and_unit_price(remaining, amount)
 
     item = clean_item_text(remaining)
-    has_detail_parts = bool(cost_per_unit or rmb or qty)
+    has_detail_parts = bool(cost_per_unit or wholesale_price or rmb or qty)
     if not customer and " " in item and (tx_type == TX_INCOME or has_detail_parts):
         item, customer = [p.strip() for p in item.rsplit(" ", 1)]
     if not item:
@@ -625,6 +646,7 @@ def parse_message(text: str) -> dict | None:
         "overdue_days":   overdue_days,
         "qty":            qty,
         "unit_price":     unit_price,
+        "wholesale_price": wholesale_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
         "channel":        guess_channel(item, customer, text),
@@ -902,7 +924,7 @@ def append_transaction(wb, data: dict) -> int:
     row = [
         data["date"], data["type"], data["amount"], data["item"],
         data["customer"], data["status"], data["pay_date"],
-        data["qty"], data["unit_price"], data["cost_per_unit"],
+        data["qty"], data["unit_price"], data["wholesale_price"], data["cost_per_unit"],
         data["gross_profit"], data["channel"], data["days_to_collect"],
         data["note"], data["category"], data["cost_structure"],
         data["month"], data["rmb"], data["exchange_rate"], data["raw"],
@@ -1066,6 +1088,8 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool, cus
         lines.append(f"數量｜{data['qty']:,} 顆/盒")
     if data["unit_price"]:
         lines.append(f"售價｜NT$ {data['unit_price']:,} / 顆")
+    if data["wholesale_price"]:
+        lines.append(f"批發售價｜NT$ {data['wholesale_price']:,} / 顆")
     if data["cost_per_unit"]:
         lines.append(f"進價｜NT$ {data['cost_per_unit']:,} / 顆")
     if data["gross_profit"] != "":
@@ -1139,7 +1163,7 @@ HELP_TEXT = """溫室帳目機器人
 
 【紀錄收入】
 基本格式：
-收入 金額 品項 客戶 [付款狀態] [期限日期] [進價]
+收入 金額 品項 客戶 [付款狀態] [期限日期] [進價] [批發價]
 
 可用簡寫：
 +金額 品項 客戶 [付款狀態]
@@ -1151,6 +1175,7 @@ HELP_TEXT = """溫室帳目機器人
 收入 50000 珍妮500顆 李淵男 未付 期限7/15
 收入 50000 珍妮500顆 李淵男 部分收 30000
 收入 50000 珍妮500顆 李淵男 進價30
+收入 20000 鹿角蕨40顆 姜孟學 批發價450 已收
 +50000 侏儒黃月1000顆 吳政翰
 
 【紀錄支出】
@@ -1178,6 +1203,7 @@ HELP_TEXT = """溫室帳目機器人
 期限日期：期限7/15 或 付款期限2026/07/15
 部分收款：部分收 30000
 進價：進價30
+批發售價：批發價120 / 批發售價120 / 批價120
 外匯：人民幣4000 / RMB4000 / 4000 RMB
 
 【自動規則】
