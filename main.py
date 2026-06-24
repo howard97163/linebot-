@@ -37,6 +37,7 @@ handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
 SHEET_TRANSACTIONS = "📋 交易記錄"
 SHEET_RECEIVABLES  = "💰 應收帳款"
+SHEET_MONTHLY_OVERVIEW = "📊 月份總覽"
 SHEET_CUSTOMER_ANALYSIS = "👥 客戶分析"
 
 TX_INCOME   = "收入"
@@ -96,9 +97,14 @@ _recent_message_id_set: set[str] = set()
 MIN_TRANSACTION_ROW = 3
 TX_LAST_COL = COL_RAW
 RECV_LAST_COL = RECV_COL_NOTE
+MONTHLY_LAST_COL = 19
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
+STATUS_COLOR_PAID = {"red": 0.72, "green": 0.95, "blue": 0.82}
+STATUS_COLOR_UNPAID = {"red": 0.98, "green": 0.82, "blue": 0.82}
+STATUS_COLOR_PARTIAL = {"red": 1.0, "green": 0.93, "blue": 0.68}
 NUMBER_PATTERN = r"\d[\d,]*(?:\.\d+)?"
+FIXED_COST_STRUCTURES = {"水電費", "租金", "人事費用"}
 
 # ══════════════════════════════════════════════════════════════
 # Google Sheets 連線
@@ -146,6 +152,19 @@ def to_number(s: str):
         raise ValueError(f"Invalid number: {s}")
     value = float(cleaned)
     return int(value) if value.is_integer() else value
+
+def column_letter(col: int) -> str:
+    letters = ""
+    while col:
+        col, remainder = divmod(col - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+def cell_a1(row: int, col: int) -> str:
+    return f"{column_letter(col)}{row}"
+
+def range_a1(start_row: int, start_col: int, end_row: int, end_col: int) -> str:
+    return f"{cell_a1(start_row, start_col)}:{cell_a1(end_row, end_col)}"
 
 def parse_date_value(value: str, default_year: int | None = None):
     value = value.strip()
@@ -236,6 +255,15 @@ def clear_receivable_overdue_format(sheet, row_num: int):
         {"backgroundColor": alternating_color_for_row(row_num)},
     )
 
+def transaction_status_background(status: str):
+    if status in (STATUS_PAID, STATUS_COLLECTED):
+        return STATUS_COLOR_PAID
+    if status == STATUS_UNPAID:
+        return STATUS_COLOR_UNPAID
+    if status == STATUS_PARTIAL:
+        return STATUS_COLOR_PARTIAL
+    return None
+
 def find_total_row(values: list[list[str]]) -> int | None:
     for i, row in enumerate(values, start=1):
         if row and "合計" in str(row[0]):
@@ -295,6 +323,44 @@ def apply_alternating_row_colors(sheet, last_col: int):
         return
 
     apply_alternating_row_colors_to(sheet, last_col, end_row)
+
+def apply_transaction_status_formats(sheet):
+    values = sheet.get_all_values()
+    end_row = last_data_row(values)
+    if end_row < MIN_TRANSACTION_ROW:
+        return
+
+    requests = []
+    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
+        row = values[row_num - 1] if len(values) >= row_num else []
+        status = row[COL_STATUS - 1].strip() if len(row) >= COL_STATUS and row[COL_STATUS - 1] else ""
+        color = transaction_status_background(status)
+        if not color:
+            continue
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": row_num - 1,
+                    "endRowIndex": row_num,
+                    "startColumnIndex": COL_STATUS - 1,
+                    "endColumnIndex": COL_STATUS,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color,
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold",
+            }
+        })
+    if requests:
+        sheet.spreadsheet.batch_update({"requests": requests})
+
+def refresh_transaction_formats(sheet):
+    apply_alternating_row_colors(sheet, TX_LAST_COL)
+    apply_transaction_status_formats(sheet)
 
 def apply_alternating_row_colors_to(sheet, last_col: int, end_row: int):
     if end_row < MIN_TRANSACTION_ROW:
@@ -386,7 +452,7 @@ def find_transaction_row(sheet, data: dict) -> int:
 
 def organize_transaction_sheet(sheet, data: dict) -> int:
     sort_sheet_by_date(sheet, TX_LAST_COL)
-    apply_alternating_row_colors(sheet, TX_LAST_COL)
+    refresh_transaction_formats(sheet)
     return find_transaction_row(sheet, data)
 
 def has_seen_message(mid):
@@ -765,10 +831,11 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
 
     # 批次更新三個欄位（減少 API 呼叫次數）
     tx_sheet.batch_update([
-        {"range": f"F{row_num}", "values": [[new_status]]},
-        {"range": f"G{row_num}", "values": [[pay_date]]},
-        {"range": f"M{row_num}", "values": [[days_to_collect]]},
+        {"range": cell_a1(row_num, COL_STATUS), "values": [[new_status]]},
+        {"range": cell_a1(row_num, COL_PAY_DATE), "values": [[pay_date]]},
+        {"range": cell_a1(row_num, COL_DAYS), "values": [[days_to_collect]]},
     ])
+    apply_transaction_status_formats(tx_sheet)
 
     # 同步應收帳款
     recv_updated = False
@@ -811,9 +878,10 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
                         except ValueError:
                             pass
                     tx_sheet.batch_update([
-                        {"range": f"F{row_num}", "values": [[new_status]]},
-                        {"range": f"M{row_num}", "values": [[days_to_collect]]},
+                        {"range": cell_a1(row_num, COL_STATUS), "values": [[new_status]]},
+                        {"range": cell_a1(row_num, COL_DAYS), "values": [[days_to_collect]]},
                     ])
+                    apply_transaction_status_formats(tx_sheet)
                 else:
                     outstanding = total_amount - total_collected
                 overdue_days = calculate_overdue_days(due_date, outstanding)
@@ -839,6 +907,10 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
             refresh_customer_analysis(wb)
         except Exception:
             logger.exception("Failed to refresh customer analysis during status update")
+    try:
+        refresh_monthly_overview(wb)
+    except Exception:
+        logger.exception("Failed to refresh monthly overview during status update")
 
     return {
         "ok":           True,
@@ -894,7 +966,7 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
 
     tx_sheet.delete_rows(row_num)
     sort_sheet_by_date(tx_sheet, TX_LAST_COL)
-    apply_alternating_row_colors(tx_sheet, TX_LAST_COL)
+    refresh_transaction_formats(tx_sheet)
     if tx_type == TX_INCOME:
         try:
             refresh_receivable_overdue_formats(wb.worksheet(SHEET_RECEIVABLES))
@@ -904,6 +976,10 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
             refresh_customer_analysis(wb)
         except Exception:
             logger.exception("Failed to refresh customer analysis after deletion")
+    try:
+        refresh_monthly_overview(wb)
+    except Exception:
+        logger.exception("Failed to refresh monthly overview after deletion")
 
     return {
         "ok": True,
@@ -1062,6 +1138,183 @@ def update_customer_analysis(wb, data: dict | None = None) -> bool:
     if data is not None and data["type"] != TX_INCOME:
         return False
     return refresh_customer_analysis(wb)
+
+def monthly_summary_empty_stats() -> dict:
+    return {
+        "income": 0,
+        "cash": 0,
+        "purchase": 0,
+        "fixed": 0,
+        "variable": 0,
+        "expense": 0,
+        "receivable": 0,
+        "exchange": 0,
+        "direct_income": 0,
+        "export_income": 0,
+        "max_transaction": 0,
+        "count": 0,
+        "collection_days": [],
+    }
+
+def format_rate(numerator: int | float, denominator: int | float) -> str:
+    if not denominator:
+        return "0.00%"
+    return f"{(numerator / denominator * 100):.2f}%"
+
+def rounded_amount(value: int | float) -> int | float:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return round(value, 2) if isinstance(value, float) else value
+
+def refresh_monthly_overview(wb) -> bool:
+    sheet = worksheet_by_names(wb, SHEET_MONTHLY_OVERVIEW, "月份總覽", "月分總覽", "月份財務總覽")
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    tx_values = tx_sheet.get_all_values()
+    monthly = {month: monthly_summary_empty_stats() for month in range(1, 13)}
+
+    for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
+        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+        tx_date = parse_date_value(str(date_text)) if date_text else None
+        if not tx_date:
+            continue
+
+        month = tx_date.month
+        entry = monthly[month]
+        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
+        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else "0"
+        status = row[COL_STATUS - 1] if len(row) >= COL_STATUS else ""
+        pay_date_text = row[COL_PAY_DATE - 1] if len(row) >= COL_PAY_DATE else ""
+        channel = row[COL_CHANNEL - 1] if len(row) >= COL_CHANNEL else ""
+        cost_structure = row[COL_COST_STRUCT - 1] if len(row) >= COL_COST_STRUCT else ""
+        days_text = row[COL_DAYS - 1] if len(row) >= COL_DAYS else ""
+
+        try:
+            amount = to_int(amount_text) if amount_text else 0
+        except ValueError:
+            amount = 0
+        if amount <= 0:
+            continue
+
+        entry["max_transaction"] = max(entry["max_transaction"], amount)
+        entry["count"] += 1
+
+        if tx_type == TX_INCOME:
+            entry["income"] += amount
+            pay_date = parse_date_value(str(pay_date_text)) if pay_date_text else None
+            if status in PAID_STATUSES and pay_date:
+                monthly[pay_date.month]["cash"] += amount
+            if channel == "大陸出口":
+                entry["export_income"] += amount
+            else:
+                entry["direct_income"] += amount
+            try:
+                if days_text != "":
+                    entry["collection_days"].append(to_number(days_text))
+            except ValueError:
+                pass
+        elif tx_type == TX_EXPENSE:
+            entry["expense"] += amount
+            if cost_structure == "進貨成本":
+                entry["purchase"] += amount
+            elif cost_structure in FIXED_COST_STRUCTURES:
+                entry["fixed"] += amount
+            elif cost_structure == "換匯":
+                entry["exchange"] += amount
+            else:
+                entry["variable"] += amount
+
+    try:
+        recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
+        recv_values = recv_sheet.get_all_values()
+        total_row = find_total_row(recv_values)
+        end_index = (total_row - 1) if total_row else len(recv_values)
+        for row in recv_values[MIN_TRANSACTION_ROW - 1:end_index]:
+            date_text = row[RECV_COL_DATE - 1] if len(row) >= RECV_COL_DATE else ""
+            recv_date = parse_date_value(str(date_text)) if date_text else None
+            if not recv_date:
+                continue
+            try:
+                outstanding = to_int(row[RECV_COL_OUTSTANDING - 1]) if len(row) >= RECV_COL_OUTSTANDING and row[RECV_COL_OUTSTANDING - 1] else 0
+            except ValueError:
+                outstanding = 0
+            try:
+                collected = to_int(row[RECV_COL_COLLECTED - 1]) if len(row) >= RECV_COL_COLLECTED and row[RECV_COL_COLLECTED - 1] else 0
+            except ValueError:
+                collected = 0
+            monthly[recv_date.month]["receivable"] += outstanding
+            if outstanding > 0 and collected > 0:
+                monthly[recv_date.month]["cash"] += collected
+    except Exception:
+        logger.exception("Failed to read receivables while building monthly overview")
+
+    rows = []
+    all_days = []
+    totals = monthly_summary_empty_stats()
+    for month in range(1, 13):
+        entry = monthly[month]
+        all_days.extend(entry["collection_days"])
+        for key in ("income", "cash", "purchase", "fixed", "variable", "expense",
+                    "receivable", "exchange", "direct_income", "export_income", "count"):
+            totals[key] += entry[key]
+        totals["max_transaction"] = max(totals["max_transaction"], entry["max_transaction"])
+
+        gross_profit = entry["income"] - entry["purchase"]
+        net_profit = entry["income"] - entry["expense"]
+        avg_days = round(sum(entry["collection_days"]) / len(entry["collection_days"]), 1) if entry["collection_days"] else 0
+        rows.append([
+            f"{month}月",
+            entry["income"],
+            entry["cash"],
+            entry["purchase"],
+            entry["fixed"],
+            entry["variable"],
+            entry["expense"],
+            gross_profit,
+            format_rate(gross_profit, entry["income"]),
+            net_profit,
+            entry["receivable"],
+            entry["cash"],
+            format_rate(entry["cash"], entry["income"]),
+            avg_days,
+            entry["exchange"],
+            entry["direct_income"],
+            entry["export_income"],
+            entry["max_transaction"],
+            entry["count"],
+        ])
+
+    total_gross_profit = totals["income"] - totals["purchase"]
+    total_net_profit = totals["income"] - totals["expense"]
+    total_avg_days = round(sum(all_days) / len(all_days), 1) if all_days else 0
+    rows.append([
+        "全年合計",
+        totals["income"],
+        totals["cash"],
+        totals["purchase"],
+        totals["fixed"],
+        totals["variable"],
+        totals["expense"],
+        total_gross_profit,
+        format_rate(total_gross_profit, totals["income"]),
+        total_net_profit,
+        totals["receivable"],
+        totals["cash"],
+        format_rate(totals["cash"], totals["income"]),
+        total_avg_days,
+        totals["exchange"],
+        totals["direct_income"],
+        totals["export_income"],
+        totals["max_transaction"],
+        totals["count"],
+    ])
+
+    sheet.update(
+        range_a1(MIN_TRANSACTION_ROW, 1, MIN_TRANSACTION_ROW + len(rows) - 1, MONTHLY_LAST_COL),
+        rows,
+        value_input_option="RAW",
+    )
+    apply_alternating_row_colors_to(sheet, MONTHLY_LAST_COL, MIN_TRANSACTION_ROW + 11)
+    return True
 
 # ══════════════════════════════════════════════════════════════
 # 回覆格式
@@ -1237,9 +1490,12 @@ HELP_TEXT = """溫室帳目機器人
 
 def refresh_receivables_job() -> dict:
     wb = get_workbook()
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
     sheet = wb.worksheet(SHEET_RECEIVABLES)
+    refresh_transaction_formats(tx_sheet)
     refresh_receivable_overdue_formats(sheet)
     refresh_customer_analysis(wb)
+    refresh_monthly_overview(wb)
     return {
         "ok": True,
         "date": today_tw().strftime("%Y/%m/%d"),
@@ -1298,7 +1554,7 @@ def handle_message(event):
         elif user_text == "整理":
             try:
                 result = refresh_receivables_job()
-                reply = f"✅ 帳款與客戶分析已整理\n日期｜{result['date']}"
+                reply = f"✅ 交易格式、帳款、月份總覽與客戶分析已整理\n日期｜{result['date']}"
             except Exception:
                 logger.exception("Manual receivables refresh failed")
                 reply = "⚠️ 整理失敗，請稍後再試。"
@@ -1376,6 +1632,7 @@ def handle_message(event):
                     recv_err   = False
                     customer_added = False
                     customer_err = False
+                    monthly_err = False
                     try:
                         recv_added = update_receivables(wb, parsed, row_num)
                     except Exception:
@@ -1386,12 +1643,19 @@ def handle_message(event):
                     except Exception:
                         customer_err = True
                         logger.exception("Failed to update customer analysis")
+                    try:
+                        refresh_monthly_overview(wb)
+                    except Exception:
+                        monthly_err = True
+                        logger.exception("Failed to refresh monthly overview")
 
                     reply = format_new_transaction_reply(parsed, row_num, recv_added, customer_added)
                     if recv_err:
                         reply += "\n⚠️ 交易已記錄，但應收帳款同步失敗。"
                     if customer_err:
                         reply += "\n⚠️ 交易已記錄，但客戶分析同步失敗。"
+                    if monthly_err:
+                        reply += "\n⚠️ 交易已記錄，但月份總覽同步失敗。"
 
         line_api.reply_message(
             ReplyMessageRequest(
