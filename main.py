@@ -37,7 +37,6 @@ handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
 SHEET_TRANSACTIONS = "📋 交易記錄"
 SHEET_RECEIVABLES  = "💰 應收帳款"
-SHEET_MONTHLY_OVERVIEW = "📊 月份總覽"
 SHEET_CUSTOMER_ANALYSIS = "👥 客戶分析"
 
 TX_INCOME   = "收入"
@@ -59,18 +58,18 @@ COL_STATUS      = 6   # 付款狀態
 COL_PAY_DATE    = 7   # 付款日期
 COL_QTY         = 8   # 數量
 COL_UNIT_PRICE  = 9   # 售出單價
-COL_WHOLESALE_PRICE = 10  # 售出批發價
-COL_COST        = 11  # 進貨單價
-COL_PROFIT      = 12  # 毛利
-COL_CHANNEL     = 13  # 銷售管道
-COL_DAYS        = 14  # 收款天數
-COL_NOTE        = 15  # 備註
-COL_CATEGORY    = 16  # 分類
-COL_COST_STRUCT = 17  # 支出成本結構
-COL_MONTH       = 18  # 月份
-COL_RMB         = 19  # 換匯金額
-COL_EXCHANGE_RATE = 20  # 匯率
-COL_RAW         = 21  # 原始備註
+COL_COST        = 10  # 進貨單價
+COL_PROFIT      = 11  # 毛利
+COL_CHANNEL     = 12  # 銷售管道
+COL_DAYS        = 13  # 收款天數
+COL_NOTE        = 14  # 備註
+COL_CATEGORY    = 15  # 分類
+COL_COST_STRUCT = 16  # 支出成本結構
+COL_MONTH       = 17  # 月份
+COL_RMB         = 18  # 換匯金額
+COL_EXCHANGE_RATE = 19  # 匯率
+COL_RAW         = 20  # 原始備註
+COL_TX_ID       = 21  # 交易編號（TX-0001，永不變動的識別碼）
 
 # 應收帳款欄位
 RECV_COL_DATE        = 1
@@ -95,16 +94,10 @@ RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
 MIN_TRANSACTION_ROW = 3
-TX_LAST_COL = COL_RAW
+TX_LAST_COL = COL_TX_ID
 RECV_LAST_COL = RECV_COL_NOTE
-MONTHLY_LAST_COL = 19
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
-STATUS_COLOR_PAID = {"red": 0.72, "green": 0.95, "blue": 0.82}
-STATUS_COLOR_UNPAID = {"red": 0.98, "green": 0.82, "blue": 0.82}
-STATUS_COLOR_PARTIAL = {"red": 1.0, "green": 0.93, "blue": 0.68}
-NUMBER_PATTERN = r"\d[\d,]*(?:\.\d+)?"
-FIXED_COST_STRUCTURES = {"水電費", "租金", "人事費用"}
 
 # ══════════════════════════════════════════════════════════════
 # Google Sheets 連線
@@ -144,27 +137,6 @@ def to_int(s: str) -> int:
     if cleaned in ("", "-", ".", "-."):
         raise ValueError(f"Invalid number: {s}")
     return int(round(float(cleaned)))
-
-def to_number(s: str):
-    cleaned = str(s).strip().replace(",", "").replace("NT$", "").replace("$", "")
-    cleaned = re.sub(r"[^\d.-]", "", cleaned)
-    if cleaned in ("", "-", ".", "-."):
-        raise ValueError(f"Invalid number: {s}")
-    value = float(cleaned)
-    return int(value) if value.is_integer() else value
-
-def column_letter(col: int) -> str:
-    letters = ""
-    while col:
-        col, remainder = divmod(col - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
-
-def cell_a1(row: int, col: int) -> str:
-    return f"{column_letter(col)}{row}"
-
-def range_a1(start_row: int, start_col: int, end_row: int, end_col: int) -> str:
-    return f"{cell_a1(start_row, start_col)}:{cell_a1(end_row, end_col)}"
 
 def parse_date_value(value: str, default_year: int | None = None):
     value = value.strip()
@@ -255,15 +227,6 @@ def clear_receivable_overdue_format(sheet, row_num: int):
         {"backgroundColor": alternating_color_for_row(row_num)},
     )
 
-def transaction_status_background(status: str):
-    if status in (STATUS_PAID, STATUS_COLLECTED):
-        return STATUS_COLOR_PAID
-    if status == STATUS_UNPAID:
-        return STATUS_COLOR_UNPAID
-    if status == STATUS_PARTIAL:
-        return STATUS_COLOR_PARTIAL
-    return None
-
 def find_total_row(values: list[list[str]]) -> int | None:
     for i, row in enumerate(values, start=1):
         if row and "合計" in str(row[0]):
@@ -324,44 +287,6 @@ def apply_alternating_row_colors(sheet, last_col: int):
 
     apply_alternating_row_colors_to(sheet, last_col, end_row)
 
-def apply_transaction_status_formats(sheet):
-    values = sheet.get_all_values()
-    end_row = last_data_row(values)
-    if end_row < MIN_TRANSACTION_ROW:
-        return
-
-    requests = []
-    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
-        row = values[row_num - 1] if len(values) >= row_num else []
-        status = row[COL_STATUS - 1].strip() if len(row) >= COL_STATUS and row[COL_STATUS - 1] else ""
-        color = transaction_status_background(status)
-        if not color:
-            continue
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet.id,
-                    "startRowIndex": row_num - 1,
-                    "endRowIndex": row_num,
-                    "startColumnIndex": COL_STATUS - 1,
-                    "endColumnIndex": COL_STATUS,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": color,
-                        "textFormat": {"bold": True},
-                    }
-                },
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold",
-            }
-        })
-    if requests:
-        sheet.spreadsheet.batch_update({"requests": requests})
-
-def refresh_transaction_formats(sheet):
-    apply_alternating_row_colors(sheet, TX_LAST_COL)
-    apply_transaction_status_formats(sheet)
-
 def apply_alternating_row_colors_to(sheet, last_col: int, end_row: int):
     if end_row < MIN_TRANSACTION_ROW:
         return
@@ -407,15 +332,6 @@ def refresh_receivable_overdue_formats(sheet):
             outstanding = 0
         if len(row) >= RECV_COL_DUE and row[RECV_COL_DUE - 1]:
             due_date = parse_date_value(row[RECV_COL_DUE - 1])
-        if outstanding <= 0:
-            existing_overdue = row[RECV_COL_OVERDUE - 1] if len(row) >= RECV_COL_OVERDUE else ""
-            try:
-                existing_overdue_days = to_int(existing_overdue) if existing_overdue else ""
-            except ValueError:
-                existing_overdue_days = ""
-            if existing_overdue_days:
-                apply_receivable_overdue_format(sheet, row_num, existing_overdue_days)
-            continue
         overdue_days = calculate_overdue_days(due_date, outstanding)
         if overdue_days:
             sheet.update_cell(row_num, RECV_COL_OVERDUE, overdue_days)
@@ -450,10 +366,10 @@ def find_transaction_row(sheet, data: dict) -> int:
             candidates.append(row_num)
     return candidates[-1] if candidates else 0
 
-def organize_transaction_sheet(sheet, data: dict) -> int:
+def organize_transaction_sheet(sheet, data: dict = None) -> None:
+    """排序 + 交替底色。定位改由 find_row_by_tx_id 處理。"""
     sort_sheet_by_date(sheet, TX_LAST_COL)
-    refresh_transaction_formats(sheet)
-    return find_transaction_row(sheet, data)
+    apply_alternating_row_colors(sheet, TX_LAST_COL)
 
 def has_seen_message(mid):
     return bool(mid and mid in _recent_message_id_set)
@@ -478,76 +394,39 @@ CATEGORIES = {
     "粉斑":"種苗銷售","豆豆龍":"種苗銷售","nano":"種苗銷售",
     "omg":"種苗銷售","delta":"種苗銷售","戰鬥機":"種苗銷售",
     "種苗":"種苗銷售","植物":"種苗銷售",
-    # 物流/包材
-    "運費":"一般運費","空軍":"空軍物流","黑貓":"黑貓宅配","郵局":"郵局寄送",
-    "宅配":"宅配","貨運":"貨運","冷藏":"冷藏配送",
-    "水苔":"水苔","紙箱":"紙箱","膠膜":"膠膜","膠帶":"膠帶",
-    "氣泡布":"氣泡布","保麗龍":"保麗龍","紙板":"紙板","包材":"包材",
-    "悶箱":"悶箱","棉花":"棉花","垃圾袋":"垃圾袋",
-    "土":"介質土","盆":"盆器","木板":"木板",
+    "運費":"運費","空軍":"運費","黑貓":"運費","郵局":"運費",
+    "水苔":"材料耗材","紙箱":"材料耗材","膠膜":"材料耗材",
+    "悶箱":"材料耗材","棉花":"材料耗材","垃圾袋":"材料耗材",
+    "土":"材料耗材","盆":"材料耗材","木板":"材料耗材",
     "電費":"水電費","水電":"水電費",
     "租金":"租金","薪水":"薪資","薪資":"薪資",
-    "工讀":"工讀","臨時工":"臨時工","獎金":"獎金","加班":"加班",
-    "換人民幣":"人民幣換匯","換rmb":"人民幣換匯","匯款":"匯款","人民幣":"人民幣換匯",
-    "燈":"燈具設備","機器":"機器設備","噴霧":"噴霧設備","冰箱":"冰箱設備","ro機":"RO設備",
-    "維修":"設備維修","修理":"設備維修","零件":"設備零件",
-    "馬達":"馬達","風扇":"風扇","水泵":"水泵","噴頭":"噴頭","管線":"管線",
-    "農藥":"農藥","肥料":"肥料",
-    "711":"7-11活動","福袋":"福袋活動",
+    "換人民幣":"換匯","換rmb":"換匯","匯款":"換匯","人民幣":"換匯",
+    "燈":"設備","機器":"設備","噴霧":"設備","冰箱":"設備","ro機":"設備",
+    "農藥":"農藥肥料","肥料":"農藥肥料",
+    "711":"活動銷售","福袋":"活動銷售",
     # 進出口
-    "檢疫":"檢疫","關稅":"關稅",
-    "罰金":"罰金","出口":"出口費用",
-    "標籤帶":"標籤帶",
+    "檢疫":"進出口費用","關稅":"進出口費用",
+    "罰金":"進出口費用","出口":"進出口費用",
+    "標籤帶":"進出口費用",
     # 差旅
-    "機票":"機票","住宿":"住宿","計程車":"計程車",
-    "接機":"接機","機加酒":"機加酒",
+    "機票":"差旅費","住宿":"差旅費","計程車":"差旅費",
+    "接機":"差旅費","機加酒":"差旅費",
     # 餐飲交際
-    "晚餐":"晚餐","尾牙":"尾牙","吃飯":"吃飯",
+    "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
     # 平台費用
-    "蝦皮手續費":"蝦皮手續費","手續費":"手續費","服務費":"服務費",
-    "刷卡":"刷卡費","金流":"金流費","平台抽成":"平台抽成",
+    "手續費":"平台費用","服務費":"平台費用",
     # 損耗退貨
-    "退錢":"退款","退款":"退款",
-    # 行銷廣告
-    "廣告":"廣告","投放":"廣告投放","拍攝":"拍攝","設計":"設計",
-    "印刷":"印刷","名片":"名片",
-    # 銀行財務
-    "轉帳費":"轉帳費","匯費":"匯費","銀行手續費":"銀行手續費","利息":"利息",
-    # 稅務規費
-    "營業稅":"營業稅","所得稅":"所得稅","規費":"規費","牌照":"牌照",
-    # 場地活動
-    "攤位":"攤位費","市集":"市集活動","展覽":"展覽","報名費":"報名費",
+    "退錢":"損耗退貨","退款":"損耗退貨",
 }
 
 COST_STRUCTURE_MAP = {
     "種苗銷售":"進貨成本","進貨":"進貨成本",
-    "一般運費":"物流費用","空軍物流":"物流費用","黑貓宅配":"物流費用",
-    "郵局寄送":"物流費用","宅配":"物流費用","貨運":"物流費用","冷藏配送":"物流費用",
-    "水苔":"耗材費用","紙箱":"耗材費用","膠膜":"耗材費用","膠帶":"耗材費用",
-    "氣泡布":"耗材費用","保麗龍":"耗材費用","紙板":"耗材費用","包材":"耗材費用",
-    "悶箱":"耗材費用","棉花":"耗材費用","垃圾袋":"耗材費用",
-    "介質土":"耗材費用","盆器":"耗材費用","木板":"耗材費用",
+    "運費":"物流費用","材料耗材":"耗材費用",
     "水電費":"水電費","租金":"租金","薪資":"人事費用",
-    "工讀":"人事費用","臨時工":"人事費用","獎金":"人事費用","加班":"人事費用",
-    "人民幣換匯":"換匯","匯款":"換匯",
-    "燈具設備":"設備投資","機器設備":"設備投資","噴霧設備":"設備投資",
-    "冰箱設備":"設備投資","RO設備":"設備投資",
-    "設備維修":"設備維修","設備零件":"設備維修","馬達":"設備維修",
-    "風扇":"設備維修","水泵":"設備維修","噴頭":"設備維修","管線":"設備維修",
-    "農藥":"農藥肥料","肥料":"農藥肥料",
-    "7-11活動":"活動銷售","福袋活動":"活動銷售",
-    "檢疫":"進出口費用","關稅":"進出口費用","罰金":"進出口費用",
-    "出口費用":"進出口費用","標籤帶":"進出口費用",
-    "機票":"差旅費","住宿":"差旅費","計程車":"差旅費","接機":"差旅費","機加酒":"差旅費",
-    "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
-    "蝦皮手續費":"平台費用","手續費":"平台費用","服務費":"平台費用",
-    "刷卡費":"平台費用","金流費":"平台費用","平台抽成":"平台費用",
-    "退款":"損耗退貨",
-    "廣告":"行銷廣告","廣告投放":"行銷廣告","拍攝":"行銷廣告",
-    "設計":"行銷廣告","印刷":"行銷廣告","名片":"行銷廣告",
-    "轉帳費":"銀行費用","匯費":"銀行費用","銀行手續費":"銀行費用","利息":"銀行費用",
-    "營業稅":"稅務規費","所得稅":"稅務規費","規費":"稅務規費","牌照":"稅務規費",
-    "攤位費":"活動費用","市集活動":"活動費用","展覽":"活動費用","報名費":"活動費用",
+    "換匯":"換匯","設備":"設備投資","農藥肥料":"農藥肥料",
+    "進出口費用":"進出口費用","差旅費":"差旅費",
+    "餐飲交際":"餐飲交際","平台費用":"平台費用",
+    "損耗退貨":"損耗退貨",
 }
 
 CHANNELS = {
@@ -581,48 +460,203 @@ def guess_cost_structure(category: str, tx_type: str) -> str:
     return COST_STRUCTURE_MAP.get(category, "其他費用")
 
 def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
-    m = re.search(rf'\$({NUMBER_PATTERN})\s*[*×x]\s*(\d[\d,]*)', item)
+    m = re.search(r'\$(\d[\d,]*)\s*[*×x]\s*(\d[\d,]*)', item)
     if m:
-        return to_int(m.group(2)), to_number(m.group(1))
-    m = re.search(rf'(\d[\d,]*)\s*[*×x]\s*\$?({NUMBER_PATTERN})', item)
+        return to_int(m.group(2)), to_int(m.group(1))
+    m = re.search(r'(\d[\d,]*)\s*[*×x]\s*\$?(\d[\d,]*)', item)
     if m:
         qty = to_int(m.group(1))
-        return qty, to_number(m.group(2))
+        return qty, to_int(m.group(2))
     m = re.search(r'(\d[\d,]*)\s*[顆盒個株]', item)
     if m:
         qty = to_int(m.group(1))
         return qty, (round(amount / qty) if qty > 0 else 0)
     return 0, 0
 
-def extract_labeled_customer(text: str) -> tuple[str, str]:
-    m = re.search(r"\s+(?:客戶|廠商|供應商|對象)\s*[:：]\s*(.+)$", text)
-    if not m:
-        return text, ""
-    customer = m.group(1).strip()
-    text = text[:m.start()].strip()
-    return text, customer
-
-def extract_wholesale_price(text: str) -> tuple[str, float | int | str]:
-    pattern = rf"(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*({NUMBER_PATTERN})"
-    m = re.search(pattern, text)
-    if not m:
-        return text, ""
-    wholesale_price = to_number(m.group(1))
-    text = (text[:m.start()] + " " + text[m.end():]).strip()
-    return re.sub(r"\s+", " ", text), wholesale_price
-
-def clean_item_text(text: str) -> str:
-    text = re.sub(r'(\d[\d,]*)\s*rmb|rmb\s*(\d[\d,]*)|人民幣\s*(\d[\d,]*)', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(rf'(?:total|總額)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(rf'(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text)
-    text = re.sub(rf'(?:進價|單價|一袋成本|成本)\s*{NUMBER_PATTERN}', ' ', text)
-    text = re.sub(r'\d[\d,]*\s*[顆盒個株袋]', ' ', text)
-    return re.sub(r"\s+", " ", text).strip()
-
 # ══════════════════════════════════════════════════════════════
-# 新增交易：解析訊息
+# 新增交易：解析訊息（雙格式支援）
+# 1. 標籤格式：類型：收入 / 金額：50000 / 品項：珍妮500顆 ...
+# 2. 空格格式：收入 50000 珍妮500顆 李淵男（原有格式）
 # ══════════════════════════════════════════════════════════════
+
+# 標籤別名對應（全形/半形冒號皆可）
+LABEL_ALIASES = {
+    "類型": "type", "收支": "type",
+    "金額": "amount", "金钱": "amount", "價格": "amount",
+    "品項": "item", "品项": "item", "項目": "item", "商品": "item",
+    "客戶": "customer", "客户": "customer", "廠商": "customer",
+    "厂商": "customer", "對象": "customer",
+    "狀態": "status", "状态": "status", "付款狀態": "status",
+    "日期": "date", "交易日期": "date",
+    "期限": "due", "付款期限": "due", "到期日": "due",
+    "進價": "cost", "进价": "cost", "成本": "cost",
+    "人民幣": "rmb", "人民币": "rmb", "rmb": "rmb", "RMB": "rmb",
+    "已收": "collected", "已收金額": "collected",
+    "備註": "note", "备注": "note",
+}
+
+# 用於在整段文字中定位所有標籤（多行或單行皆可）
+_LABEL_TOKEN_RE = re.compile(
+    r"(" + "|".join(sorted(map(re.escape, LABEL_ALIASES), key=len, reverse=True)) + r")\s*[：:]"
+)
+
+def is_labeled_format(text: str) -> bool:
+    """文字中出現任何已知「標籤：」即視為標籤格式（單行多標籤也可）。"""
+    return bool(_LABEL_TOKEN_RE.search(text))
+
+def extract_labeled_fields(text: str) -> dict:
+    """
+    同時支援兩種寫法：
+    1. 多行，一行一個欄位：
+       類型：收入\n金額：50000\n品項：珍妮500顆
+    2. 單行多標籤（圖文選單按鈕送出的格式）：
+       日期： 類型：收入 金額：50000 品項：珍妮 客戶：李淵男
+    值的範圍 = 此標籤之後、下一個標籤之前的文字。
+    同一標籤出現多次時，以最後一次為準。
+    """
+    fields = {}
+    matches = list(_LABEL_TOKEN_RE.finditer(text))
+    for idx, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        value = text[start:end].strip().strip("，,、")
+        key = LABEL_ALIASES.get(label)
+        if key and value:
+            fields[key] = value
+    return fields
+
+def parse_labeled_message(text: str) -> dict | None:
+    """解析標籤格式訊息，轉換成與空格格式相同的資料字典。"""
+    fields = extract_labeled_fields(text)
+
+    # 必填檢查
+    tx_type = fields.get("type", "").strip()
+    if tx_type in ("+",):
+        tx_type = TX_INCOME
+    elif tx_type in ("-",):
+        tx_type = TX_EXPENSE
+    if tx_type not in (TX_INCOME, TX_EXPENSE):
+        return None
+    if "amount" not in fields or "item" not in fields:
+        return None
+    try:
+        amount = to_int(fields["amount"])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+
+    item = fields["item"].strip()
+    if not item:
+        return None
+    customer = fields.get("customer", "").strip()
+
+    # 日期
+    today = today_tw()
+    tx_date = today
+    if "date" in fields:
+        parsed_date = parse_date_value(fields["date"], today.year)
+        if parsed_date is None:
+            return None
+        tx_date = parsed_date
+
+    # 付款狀態
+    status = fields.get("status", "").strip()
+    initial_collected = 0
+    if "collected" in fields:
+        try:
+            initial_collected = to_int(fields["collected"])
+        except ValueError:
+            return None
+        if initial_collected <= 0 or initial_collected >= amount:
+            return None
+        status = STATUS_PARTIAL
+    if status and status not in STATUS_VALUES:
+        return None
+    if not status:
+        status = STATUS_UNPAID if tx_type == TX_INCOME else STATUS_PAID
+    if status == STATUS_PARTIAL and initial_collected == 0:
+        return None
+
+    # 付款期限（僅收入未付/部分收有意義）
+    due_date = add_months(tx_date, 1)
+    if "due" in fields:
+        parsed_due = parse_date_value(fields["due"], tx_date.year)
+        if parsed_due is None:
+            return None
+        due_date = parsed_due
+
+    # 進價
+    cost_per_unit = 0
+    if "cost" in fields:
+        try:
+            cost_per_unit = to_int(fields["cost"])
+        except ValueError:
+            return None
+
+    # 人民幣與匯率
+    rmb = ""
+    exchange_rate = ""
+    if "rmb" in fields:
+        try:
+            rmb = to_int(fields["rmb"])
+        except ValueError:
+            return None
+        if rmb > 0:
+            exchange_rate = round(amount / rmb, 2)
+        else:
+            rmb = ""
+
+    note = fields.get("note", "")
+
+    qty, unit_price = extract_qty_and_unit_price(item, amount)
+
+    gross_profit = ""
+    if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
+        gross_profit = amount - (cost_per_unit * qty)
+
+    outstanding = amount - initial_collected if status == STATUS_PARTIAL else amount
+    overdue_days = calculate_overdue_days(due_date, outstanding) if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else ""
+    category = guess_category(f"{item} {text}")
+
+    # 原始備註：壓成單行，方便試算表閱讀
+    raw_single_line = " ".join(l.strip() for l in text.splitlines() if l.strip())
+
+    return {
+        "date":           tx_date.strftime("%Y/%m/%d"),
+        "type":           tx_type,
+        "amount":         amount,
+        "item":           item,
+        "customer":       customer,
+        "status":         status,
+        "pay_date":       tx_date.strftime("%Y/%m/%d") if status in PAID_STATUSES else "",
+        "due_date":       due_date.strftime("%Y/%m/%d") if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else "",
+        "initial_collected": initial_collected,
+        "outstanding":    outstanding,
+        "overdue_days":   overdue_days,
+        "qty":            qty,
+        "unit_price":     unit_price,
+        "cost_per_unit":  cost_per_unit,
+        "gross_profit":   gross_profit,
+        "channel":        guess_channel(item, customer, text),
+        "days_to_collect": "",
+        "note":           note,
+        "category":       category,
+        "cost_structure": guess_cost_structure(category, tx_type),
+        "month":          f"{tx_date.month}月",
+        "rmb":            rmb,
+        "exchange_rate":  exchange_rate,
+        "raw":            raw_single_line,
+    }
+
 def parse_message(text: str) -> dict | None:
+    """總入口：標籤格式優先，否則走原本的空格格式。"""
+    if is_labeled_format(text):
+        return parse_labeled_message(text)
+    return parse_spaced_message(text)
+
+def parse_spaced_message(text: str) -> dict | None:
     text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
     tx_date, text = parse_optional_transaction_date(text)
     if tx_date is None:
@@ -664,14 +698,11 @@ def parse_message(text: str) -> dict | None:
     if sm:
         remaining = remaining[:sm.start()].strip()
 
-    remaining, wholesale_price = extract_wholesale_price(remaining)
-    remaining, customer = extract_labeled_customer(remaining)
-
     cost_per_unit = 0
-    cm = re.search(rf'進價\s*({NUMBER_PATTERN})', remaining)
+    cm = re.search(r'進價\s*(\d[\d,]*)', remaining)
     if cm:
-        cost_per_unit = to_number(cm.group(1))
-        remaining = re.sub(rf'進價\s*{NUMBER_PATTERN}', '', remaining).strip()
+        cost_per_unit = to_int(cm.group(1))
+        remaining = re.sub(r'進價\s*\d[\d,]*', '', remaining).strip()
 
     rmb = ""
     exchange_rate = ""
@@ -681,14 +712,12 @@ def parse_message(text: str) -> dict | None:
         if rmb > 0:
             exchange_rate = round(amount / rmb, 2)
 
-    qty, unit_price = extract_qty_and_unit_price(remaining, amount)
+    item = remaining
+    customer = ""
+    if tx_type == TX_INCOME and " " in remaining:
+        item, customer = [p.strip() for p in remaining.rsplit(" ", 1)]
 
-    item = clean_item_text(remaining)
-    has_detail_parts = bool(cost_per_unit or wholesale_price or rmb or qty)
-    if not customer and " " in item and (tx_type == TX_INCOME or has_detail_parts):
-        item, customer = [p.strip() for p in item.rsplit(" ", 1)]
-    if not item:
-        return None
+    qty, unit_price = extract_qty_and_unit_price(item, amount)
 
     gross_profit = ""
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
@@ -712,7 +741,6 @@ def parse_message(text: str) -> dict | None:
         "overdue_days":   overdue_days,
         "qty":            qty,
         "unit_price":     unit_price,
-        "wholesale_price": wholesale_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
         "channel":        guess_channel(item, customer, text),
@@ -734,33 +762,84 @@ def parse_message(text: str) -> dict | None:
 # ══════════════════════════════════════════════════════════════
 def parse_update_command(text: str) -> dict | None:
     m = re.match(
-        rf"^更新\s+(\d+)\s+({STATUS_COLLECTED}|{STATUS_PAID}|{STATUS_PARTIAL})"
+        rf"^更新\s+(TX-?\d+|\d+)\s+({STATUS_COLLECTED}|{STATUS_PAID}|{STATUS_PARTIAL})"
         rf"(?:\s+([\d,]+))?$",
-        text.strip()
+        text.strip(), re.IGNORECASE
     )
     if not m:
+        return None
+    tx_id = normalize_tx_id(m.group(1).replace("TX", "TX-").replace("TX--", "TX-") if m.group(1).upper().startswith("TX") and "-" not in m.group(1) else m.group(1))
+    if tx_id is None:
         return None
     status = m.group(2)
     collected = to_int(m.group(3)) if m.group(3) else None
     if status == STATUS_PARTIAL and (collected is None or collected <= 0):
         return None
     return {
-        "row":       int(m.group(1)),
+        "tx_id":     tx_id,
         "status":    status,
         "collected": collected,
     }
 
 def parse_delete_command(text: str) -> dict | None:
-    m = re.match(r"^刪除(?:交易(?:紀錄|記錄)?)?\s+(\d+)$", text.strip())
+    m = re.match(r"^刪除(?:交易(?:紀錄|記錄)?)?\s+(TX-?\d+|\d+)$", text.strip(), re.IGNORECASE)
     if not m:
         return None
-    return {"row": int(m.group(1))}
+    raw_id = m.group(1)
+    if raw_id.upper().startswith("TX") and "-" not in raw_id:
+        raw_id = raw_id.upper().replace("TX", "TX-")
+    tx_id = normalize_tx_id(raw_id)
+    if tx_id is None:
+        return None
+    return {"tx_id": tx_id}
 
-def receivable_note(raw: str, row_num: int) -> str:
-    return f"[交易行號:{row_num}] {raw}".strip()
+# ══════════════════════════════════════════════════════════════
+# 交易編號（TX-ID）：每筆交易的永久識別碼，不受排序影響
+# ══════════════════════════════════════════════════════════════
+TX_ID_PATTERN = re.compile(r"^TX-(\d+)$", re.IGNORECASE)
 
-def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, item: str, amount: int, raw: str = "") -> int | None:
-    marker = f"[交易行號:{row_num}]"
+def format_tx_id(n: int) -> str:
+    return f"TX-{n:04d}"
+
+def next_tx_id(sheet) -> str:
+    """掃描交易編號欄，取最大值 +1。"""
+    max_n = 0
+    try:
+        col_values = sheet.col_values(COL_TX_ID)
+    except Exception:
+        col_values = []
+    for v in col_values:
+        m = TX_ID_PATTERN.match(str(v).strip())
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return format_tx_id(max_n + 1)
+
+def normalize_tx_id(text: str) -> str | None:
+    """接受 TX-0021 / tx-21 / 21，統一轉為 TX-0021。"""
+    t = text.strip()
+    m = TX_ID_PATTERN.match(t)
+    if m:
+        return format_tx_id(int(m.group(1)))
+    if t.isdigit():
+        return format_tx_id(int(t))
+    return None
+
+def find_row_by_tx_id(sheet, tx_id: str) -> int:
+    """用交易編號找到目前所在行號，找不到回傳 0。"""
+    try:
+        col_values = sheet.col_values(COL_TX_ID)
+    except Exception:
+        return 0
+    for i, v in enumerate(col_values, start=1):
+        if str(v).strip().upper() == tx_id.upper():
+            return i
+    return 0
+
+def receivable_note(raw: str, tx_id: str) -> str:
+    return f"[{tx_id}] {raw}".strip()
+
+def find_receivable_row(all_recv: list[list[str]], tx_id: str, customer: str, item: str, amount: int, raw: str = "") -> int | None:
+    marker = f"[{tx_id}]"
     raw_matches = []
     fallback_matches = []
     for i, r in enumerate(all_recv, start=1):
@@ -790,15 +869,16 @@ def find_receivable_row(all_recv: list[list[str]], row_num: int, customer: str, 
 # ══════════════════════════════════════════════════════════════
 # 更新付款狀態：寫入試算表
 # ══════════════════════════════════════════════════════════════
-def apply_status_update(wb, row_num: int, new_status: str, collected: int | None) -> dict:
-    if row_num < MIN_TRANSACTION_ROW:
-        return {"ok": False, "error": "請確認行號是否為交易資料列"}
-
+def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) -> dict:
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    if not row_num or row_num < MIN_TRANSACTION_ROW:
+        return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
+
     row_data  = tx_sheet.row_values(row_num)
 
     if not row_data or len(row_data) < COL_AMOUNT:
-        return {"ok": False, "error": f"找不到第 {row_num} 行，請確認行號是否正確"}
+        return {"ok": False, "error": f"找不到交易編號 {tx_id} 的資料，請確認試算表"}
 
     orig_date_str = row_data[COL_DATE - 1]
     tx_type  = row_data[COL_TYPE - 1] if len(row_data) >= COL_TYPE else ""
@@ -815,7 +895,9 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         return {"ok": False, "error": "此列不是有效的交易資料列"}
     if new_status == STATUS_PARTIAL:
         if collected is None or collected <= 0:
-            return {"ok": False, "error": "部分收必須填寫本次收到的金額"}
+            return {"ok": False, "error": "部分收必須填寫已收金額"}
+        if collected >= total_amount:
+            return {"ok": False, "error": "部分收金額需小於交易金額；若已全收請用「已收」"}
 
     today    = today_tw()
     pay_date = today.strftime("%Y/%m/%d")
@@ -831,20 +913,17 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
 
     # 批次更新三個欄位（減少 API 呼叫次數）
     tx_sheet.batch_update([
-        {"range": cell_a1(row_num, COL_STATUS), "values": [[new_status]]},
-        {"range": cell_a1(row_num, COL_PAY_DATE), "values": [[pay_date]]},
-        {"range": cell_a1(row_num, COL_DAYS), "values": [[days_to_collect]]},
+        {"range": f"F{row_num}", "values": [[new_status]]},
+        {"range": f"G{row_num}", "values": [[pay_date]]},
+        {"range": f"M{row_num}", "values": [[days_to_collect]]},
     ])
-    apply_transaction_status_formats(tx_sheet)
 
     # 同步應收帳款
     recv_updated = False
-    total_collected = collected
-    outstanding = ""
     try:
         recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
         all_recv   = recv_sheet.get_all_values()
-        recv_row = find_receivable_row(all_recv, row_num, customer, item, total_amount, raw)
+        recv_row = find_receivable_row(all_recv, tx_id, customer, item, total_amount, raw)
 
         if tx_type == TX_INCOME and recv_row:
             recv_data = all_recv[recv_row - 1] if len(all_recv) >= recv_row else []
@@ -855,49 +934,25 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
                 recv_sheet.batch_update([
                     {"range": f"E{recv_row}", "values": [[total_amount]]},
                     {"range": f"F{recv_row}", "values": [[0]]},
-                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
+                    {"range": f"H{recv_row}", "values": [[""]]},
+                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, tx_id)]]},
                 ])
+                clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
             elif new_status == STATUS_PARTIAL:
-                # 部分收款：輸入金額視為「本次收款」，需累加到既有已收金額。
-                previous_collected_text = recv_data[RECV_COL_COLLECTED - 1] if len(recv_data) >= RECV_COL_COLLECTED else "0"
-                try:
-                    previous_collected = to_int(previous_collected_text) if previous_collected_text else 0
-                except ValueError:
-                    previous_collected = 0
-                total_collected = previous_collected + collected
-                if total_collected >= total_amount:
-                    total_collected = total_amount
-                    outstanding = 0
-                    new_status = STATUS_COLLECTED
-                    days_to_collect = ""
-                    if orig_date_str:
-                        try:
-                            orig = datetime.strptime(orig_date_str, "%Y/%m/%d").date()
-                            days_to_collect = (today - orig).days
-                        except ValueError:
-                            pass
-                    tx_sheet.batch_update([
-                        {"range": cell_a1(row_num, COL_STATUS), "values": [[new_status]]},
-                        {"range": cell_a1(row_num, COL_DAYS), "values": [[days_to_collect]]},
-                    ])
-                    apply_transaction_status_formats(tx_sheet)
-                else:
-                    outstanding = total_amount - total_collected
+                # 部分收款
+                outstanding = total_amount - collected
                 overdue_days = calculate_overdue_days(due_date, outstanding)
-                receivable_updates = [
-                    {"range": f"E{recv_row}", "values": [[total_collected]]},
+                recv_sheet.batch_update([
+                    {"range": f"E{recv_row}", "values": [[collected]]},
                     {"range": f"F{recv_row}", "values": [[outstanding]]},
-                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, row_num)]]},
-                ]
-                if outstanding > 0:
-                    receivable_updates.append({"range": f"H{recv_row}", "values": [[overdue_days]]})
-                recv_sheet.batch_update(receivable_updates)
-                if outstanding > 0:
-                    if overdue_days:
-                        apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
-                    else:
-                        clear_receivable_overdue_format(recv_sheet, recv_row)
+                    {"range": f"H{recv_row}", "values": [[overdue_days]]},
+                    {"range": f"I{recv_row}", "values": [[receivable_note(raw, tx_id)]]},
+                ])
+                if overdue_days:
+                    apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
+                else:
+                    clear_receivable_overdue_format(recv_sheet, recv_row)
                 recv_updated = True
         refresh_receivable_overdue_formats(recv_sheet)
     except Exception:
@@ -907,13 +962,10 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
             refresh_customer_analysis(wb)
         except Exception:
             logger.exception("Failed to refresh customer analysis during status update")
-    try:
-        refresh_monthly_overview(wb)
-    except Exception:
-        logger.exception("Failed to refresh monthly overview during status update")
 
     return {
         "ok":           True,
+        "tx_id":        tx_id,
         "row_num":      row_num,
         "type":         tx_type,
         "item":         item,
@@ -922,20 +974,19 @@ def apply_status_update(wb, row_num: int, new_status: str, collected: int | None
         "pay_date":     pay_date,
         "days":         days_to_collect,
         "recv_updated": recv_updated,
-        "collected":    total_collected,
-        "received_now": collected,
-        "outstanding":  outstanding,
+        "collected":    collected,
         "total_amount": amount_str,
     }
 
-def apply_delete_transaction(wb, row_num: int) -> dict:
-    if row_num < MIN_TRANSACTION_ROW:
-        return {"ok": False, "error": "請確認行號是否為交易資料列"}
-
+def apply_delete_transaction(wb, tx_id: str) -> dict:
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    if not row_num or row_num < MIN_TRANSACTION_ROW:
+        return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
+
     row_data = tx_sheet.row_values(row_num)
     if not row_data or len(row_data) < COL_AMOUNT:
-        return {"ok": False, "error": f"找不到第 {row_num} 行，請確認行號是否正確"}
+        return {"ok": False, "error": f"找不到交易編號 {tx_id} 的資料，請確認試算表"}
 
     tx_type = row_data[COL_TYPE - 1] if len(row_data) >= COL_TYPE else ""
     item = row_data[COL_ITEM - 1] if len(row_data) >= COL_ITEM else ""
@@ -956,7 +1007,7 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
         try:
             recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
             all_recv = recv_sheet.get_all_values()
-            recv_row = find_receivable_row(all_recv, row_num, customer, item, amount, raw)
+            recv_row = find_receivable_row(all_recv, tx_id, customer, item, amount, raw)
             if recv_row:
                 recv_sheet.delete_rows(recv_row)
                 recv_deleted = True
@@ -966,7 +1017,7 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
 
     tx_sheet.delete_rows(row_num)
     sort_sheet_by_date(tx_sheet, TX_LAST_COL)
-    refresh_transaction_formats(tx_sheet)
+    apply_alternating_row_colors(tx_sheet, TX_LAST_COL)
     if tx_type == TX_INCOME:
         try:
             refresh_receivable_overdue_formats(wb.worksheet(SHEET_RECEIVABLES))
@@ -976,13 +1027,10 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
             refresh_customer_analysis(wb)
         except Exception:
             logger.exception("Failed to refresh customer analysis after deletion")
-    try:
-        refresh_monthly_overview(wb)
-    except Exception:
-        logger.exception("Failed to refresh monthly overview after deletion")
 
     return {
         "ok": True,
+        "tx_id": tx_id,
         "row_num": row_num,
         "type": tx_type,
         "item": item,
@@ -995,21 +1043,26 @@ def apply_delete_transaction(wb, row_num: int) -> dict:
 # ══════════════════════════════════════════════════════════════
 # 寫入新交易
 # ══════════════════════════════════════════════════════════════
-def append_transaction(wb, data: dict) -> int:
+def append_transaction(wb, data: dict) -> tuple[int, str]:
+    """寫入交易並回傳 (目前行號, 交易編號)。"""
     sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    tx_id = next_tx_id(sheet)
+    data["tx_id"] = tx_id
     row = [
         data["date"], data["type"], data["amount"], data["item"],
         data["customer"], data["status"], data["pay_date"],
-        data["qty"], data["unit_price"], data["wholesale_price"], data["cost_per_unit"],
+        data["qty"], data["unit_price"], data["cost_per_unit"],
         data["gross_profit"], data["channel"], data["days_to_collect"],
         data["note"], data["category"], data["cost_structure"],
         data["month"], data["rmb"], data["exchange_rate"], data["raw"],
+        tx_id,
     ]
     sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-    sorted_row_num = organize_transaction_sheet(sheet, data)
-    return sorted_row_num if sorted_row_num else len(sheet.col_values(1))
+    organize_transaction_sheet(sheet, data)
+    row_num = find_row_by_tx_id(sheet, tx_id)
+    return (row_num if row_num else len(sheet.col_values(1)), tx_id)
 
-def update_receivables(wb, data: dict, row_num: int) -> bool:
+def update_receivables(wb, data: dict, tx_id: str) -> bool:
     if data["type"] != TX_INCOME:
         return False
     if data["status"] not in (STATUS_UNPAID, STATUS_PARTIAL):
@@ -1028,7 +1081,7 @@ def update_receivables(wb, data: dict, row_num: int) -> bool:
     sheet.insert_row(
         [data["date"], data["customer"], data["item"],
          data["amount"], data["initial_collected"], data["outstanding"],
-         data["due_date"], data["overdue_days"], receivable_note(data["raw"], row_num)],
+         data["due_date"], data["overdue_days"], receivable_note(data["raw"], tx_id)],
         insert_at,
         value_input_option="RAW",
     )
@@ -1139,191 +1192,14 @@ def update_customer_analysis(wb, data: dict | None = None) -> bool:
         return False
     return refresh_customer_analysis(wb)
 
-def monthly_summary_empty_stats() -> dict:
-    return {
-        "income": 0,
-        "cash": 0,
-        "purchase": 0,
-        "fixed": 0,
-        "variable": 0,
-        "expense": 0,
-        "receivable": 0,
-        "exchange": 0,
-        "direct_income": 0,
-        "export_income": 0,
-        "max_transaction": 0,
-        "count": 0,
-        "collection_days": [],
-    }
-
-def format_rate(numerator: int | float, denominator: int | float) -> str:
-    if not denominator:
-        return "0.00%"
-    return f"{(numerator / denominator * 100):.2f}%"
-
-def rounded_amount(value: int | float) -> int | float:
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return round(value, 2) if isinstance(value, float) else value
-
-def refresh_monthly_overview(wb) -> bool:
-    sheet = worksheet_by_names(wb, SHEET_MONTHLY_OVERVIEW, "月份總覽", "月分總覽", "月份財務總覽")
-    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    tx_values = tx_sheet.get_all_values()
-    monthly = {month: monthly_summary_empty_stats() for month in range(1, 13)}
-
-    for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
-        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
-        tx_date = parse_date_value(str(date_text)) if date_text else None
-        if not tx_date:
-            continue
-
-        month = tx_date.month
-        entry = monthly[month]
-        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
-        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else "0"
-        status = row[COL_STATUS - 1] if len(row) >= COL_STATUS else ""
-        pay_date_text = row[COL_PAY_DATE - 1] if len(row) >= COL_PAY_DATE else ""
-        channel = row[COL_CHANNEL - 1] if len(row) >= COL_CHANNEL else ""
-        cost_structure = row[COL_COST_STRUCT - 1] if len(row) >= COL_COST_STRUCT else ""
-        days_text = row[COL_DAYS - 1] if len(row) >= COL_DAYS else ""
-
-        try:
-            amount = to_int(amount_text) if amount_text else 0
-        except ValueError:
-            amount = 0
-        if amount <= 0:
-            continue
-
-        entry["max_transaction"] = max(entry["max_transaction"], amount)
-        entry["count"] += 1
-
-        if tx_type == TX_INCOME:
-            entry["income"] += amount
-            pay_date = parse_date_value(str(pay_date_text)) if pay_date_text else None
-            if status in PAID_STATUSES and pay_date:
-                monthly[pay_date.month]["cash"] += amount
-            if channel == "大陸出口":
-                entry["export_income"] += amount
-            else:
-                entry["direct_income"] += amount
-            try:
-                if days_text != "":
-                    entry["collection_days"].append(to_number(days_text))
-            except ValueError:
-                pass
-        elif tx_type == TX_EXPENSE:
-            entry["expense"] += amount
-            if cost_structure == "進貨成本":
-                entry["purchase"] += amount
-            elif cost_structure in FIXED_COST_STRUCTURES:
-                entry["fixed"] += amount
-            elif cost_structure == "換匯":
-                entry["exchange"] += amount
-            else:
-                entry["variable"] += amount
-
-    try:
-        recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
-        recv_values = recv_sheet.get_all_values()
-        total_row = find_total_row(recv_values)
-        end_index = (total_row - 1) if total_row else len(recv_values)
-        for row in recv_values[MIN_TRANSACTION_ROW - 1:end_index]:
-            date_text = row[RECV_COL_DATE - 1] if len(row) >= RECV_COL_DATE else ""
-            recv_date = parse_date_value(str(date_text)) if date_text else None
-            if not recv_date:
-                continue
-            try:
-                outstanding = to_int(row[RECV_COL_OUTSTANDING - 1]) if len(row) >= RECV_COL_OUTSTANDING and row[RECV_COL_OUTSTANDING - 1] else 0
-            except ValueError:
-                outstanding = 0
-            try:
-                collected = to_int(row[RECV_COL_COLLECTED - 1]) if len(row) >= RECV_COL_COLLECTED and row[RECV_COL_COLLECTED - 1] else 0
-            except ValueError:
-                collected = 0
-            monthly[recv_date.month]["receivable"] += outstanding
-            if outstanding > 0 and collected > 0:
-                monthly[recv_date.month]["cash"] += collected
-    except Exception:
-        logger.exception("Failed to read receivables while building monthly overview")
-
-    rows = []
-    all_days = []
-    totals = monthly_summary_empty_stats()
-    for month in range(1, 13):
-        entry = monthly[month]
-        all_days.extend(entry["collection_days"])
-        for key in ("income", "cash", "purchase", "fixed", "variable", "expense",
-                    "receivable", "exchange", "direct_income", "export_income", "count"):
-            totals[key] += entry[key]
-        totals["max_transaction"] = max(totals["max_transaction"], entry["max_transaction"])
-
-        gross_profit = entry["income"] - entry["purchase"]
-        net_profit = entry["income"] - entry["expense"]
-        avg_days = round(sum(entry["collection_days"]) / len(entry["collection_days"]), 1) if entry["collection_days"] else 0
-        rows.append([
-            f"{month}月",
-            entry["income"],
-            entry["cash"],
-            entry["purchase"],
-            entry["fixed"],
-            entry["variable"],
-            entry["expense"],
-            gross_profit,
-            format_rate(gross_profit, entry["income"]),
-            net_profit,
-            entry["receivable"],
-            entry["cash"],
-            format_rate(entry["cash"], entry["income"]),
-            avg_days,
-            entry["exchange"],
-            entry["direct_income"],
-            entry["export_income"],
-            entry["max_transaction"],
-            entry["count"],
-        ])
-
-    total_gross_profit = totals["income"] - totals["purchase"]
-    total_net_profit = totals["income"] - totals["expense"]
-    total_avg_days = round(sum(all_days) / len(all_days), 1) if all_days else 0
-    rows.append([
-        "全年合計",
-        totals["income"],
-        totals["cash"],
-        totals["purchase"],
-        totals["fixed"],
-        totals["variable"],
-        totals["expense"],
-        total_gross_profit,
-        format_rate(total_gross_profit, totals["income"]),
-        total_net_profit,
-        totals["receivable"],
-        totals["cash"],
-        format_rate(totals["cash"], totals["income"]),
-        total_avg_days,
-        totals["exchange"],
-        totals["direct_income"],
-        totals["export_income"],
-        totals["max_transaction"],
-        totals["count"],
-    ])
-
-    sheet.update(
-        range_a1(MIN_TRANSACTION_ROW, 1, MIN_TRANSACTION_ROW + len(rows) - 1, MONTHLY_LAST_COL),
-        rows,
-        value_input_option="RAW",
-    )
-    apply_alternating_row_colors_to(sheet, MONTHLY_LAST_COL, MIN_TRANSACTION_ROW + 11)
-    return True
-
 # ══════════════════════════════════════════════════════════════
 # 回覆格式
 # ══════════════════════════════════════════════════════════════
-def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool, customer_added: bool = False) -> str:
+def format_new_transaction_reply(data: dict, tx_id: str, recv_added: bool, customer_added: bool = False) -> str:
     icon        = "💰" if data["type"] == TX_INCOME else "💸"
     status_icon = {"已收":"✅","已付":"✅","未付":"⏳","部分收":"⚠️"}.get(data["status"], "")
     lines = [
-        f"{icon} 已記錄到第 {row_num} 行",
+        f"{icon} 已記錄 交易編號 {tx_id}",
         "─" * 22,
         f"日期｜{data['date']}",
         f"類型｜{data['type']}",
@@ -1341,8 +1217,6 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool, cus
         lines.append(f"數量｜{data['qty']:,} 顆/盒")
     if data["unit_price"]:
         lines.append(f"售價｜NT$ {data['unit_price']:,} / 顆")
-    if data["wholesale_price"]:
-        lines.append(f"批發售價｜NT$ {data['wholesale_price']:,} / 顆")
     if data["cost_per_unit"]:
         lines.append(f"進價｜NT$ {data['cost_per_unit']:,} / 顆")
     if data["gross_profit"] != "":
@@ -1367,13 +1241,13 @@ def format_new_transaction_reply(data: dict, row_num: int, recv_added: bool, cus
     if customer_added:
         lines.append("👥 已新增到客戶分析")
     lines.append("✏️ 更新付款狀態請輸入：")
-    lines.append(f"更新 {row_num} 已收")
+    lines.append(f"更新 {tx_id} 已收")
     return "\n".join(lines)
 
 def format_update_reply(result: dict) -> str:
     status_icon = {"已收":"✅","已付":"✅","部分收":"⚠️"}.get(result["new_status"], "")
     lines = [
-        f"✅ 第 {result['row_num']} 行已更新",
+        f"✅ 交易 {result['tx_id']} 已更新",
         "─" * 22,
         f"品項｜{result['item']}",
     ]
@@ -1383,12 +1257,8 @@ def format_update_reply(result: dict) -> str:
         f"狀態｜{status_icon} {result['new_status']}",
         f"付款日｜{result['pay_date']}",
     ]
-    if result["received_now"]:
-        lines.append(f"本次收款｜NT$ {result['received_now']:,}")
-    if result["collected"]:
-        lines.append(f"累計已收｜NT$ {result['collected']:,} / NT$ {result['total_amount']}")
-    if result["outstanding"] != "":
-        lines.append(f"未收餘額｜NT$ {result['outstanding']:,}")
+    if result["new_status"] == STATUS_PARTIAL and result["collected"]:
+        lines.append(f"已收｜NT$ {result['collected']:,} / NT$ {result['total_amount']}")
     if result["days"] != "":
         lines.append(f"收款天數｜{result['days']} 天")
     lines.append("─" * 22)
@@ -1416,7 +1286,7 @@ HELP_TEXT = """溫室帳目機器人
 
 【紀錄收入】
 基本格式：
-收入 金額 品項 客戶 [付款狀態] [期限日期] [進價] [批發價]
+收入 金額 品項 客戶 [付款狀態] [期限日期] [進價]
 
 可用簡寫：
 +金額 品項 客戶 [付款狀態]
@@ -1428,7 +1298,6 @@ HELP_TEXT = """溫室帳目機器人
 收入 50000 珍妮500顆 李淵男 未付 期限7/15
 收入 50000 珍妮500顆 李淵男 部分收 30000
 收入 50000 珍妮500顆 李淵男 進價30
-收入 20000 鹿角蕨40顆 姜孟學 批發價450 已收
 +50000 侏儒黃月1000顆 吳政翰
 
 【紀錄支出】
@@ -1456,8 +1325,33 @@ HELP_TEXT = """溫室帳目機器人
 期限日期：期限7/15 或 付款期限2026/07/15
 部分收款：部分收 30000
 進價：進價30
-批發售價：批發價120 / 批發售價120 / 批價120
 外匯：人民幣4000 / RMB4000 / 4000 RMB
+
+【標籤格式（可搭配選單按鈕）】
+多行或單行都可以，順序隨意：
+
+多行寫法：
+日期：5/29
+類型：收入
+金額：50000
+品項：珍妮500顆
+客戶：李淵男
+狀態：未付
+期限：7/15
+
+單行寫法（按鈕範本）：
+日期： 類型：收入 金額：50000 品項：珍妮500顆 客戶：李淵男 狀態：未付 期限：
+
+其他可用標籤：
+進價：30
+人民幣：4000
+已收：30000（部分收時填）
+備註：任意文字
+
+必填：類型、金額、品項
+日期留空＝今天
+期限留空＝交易日起1個月
+其餘留空的標籤會自動略過
 
 【自動規則】
 未輸入日期：預設今天
@@ -1468,34 +1362,33 @@ HELP_TEXT = """溫室帳目機器人
 收入的新客戶：自動加入客戶分析
 
 【更新付款狀態】
-更新 行號 已收
-更新 行號 已付
-更新 行號 部分收 本次收款金額
+更新 交易編號 已收
+更新 交易編號 已付
+更新 交易編號 部分收 金額
 
 更新範例：
-更新 21 已收
-更新 21 已付
-更新 21 部分收 30000
-部分收會累加到既有已收金額；累計達全額時會自動結清
+更新 TX-0021 已收
+更新 21 已收（可省略TX-）
+更新 TX-0021 部分收 30000
 
 【刪除交易】
-刪除 行號
-刪除交易 行號
-刪除交易紀錄 行號
+刪除 交易編號
+刪除交易 交易編號
 
 刪除範例：
-刪除 25
-刪除交易 25
-刪除交易紀錄 25"""
+刪除 TX-0025
+刪除 25（可省略TX-）
+
+【關於交易編號】
+每筆交易有固定編號（如TX-0021）
+記錄成功時會顯示在回覆中
+編號不會因排序而改變"""
 
 def refresh_receivables_job() -> dict:
     wb = get_workbook()
-    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
     sheet = wb.worksheet(SHEET_RECEIVABLES)
-    refresh_transaction_formats(tx_sheet)
     refresh_receivable_overdue_formats(sheet)
     refresh_customer_analysis(wb)
-    refresh_monthly_overview(wb)
     return {
         "ok": True,
         "date": today_tw().strftime("%Y/%m/%d"),
@@ -1554,7 +1447,7 @@ def handle_message(event):
         elif user_text == "整理":
             try:
                 result = refresh_receivables_job()
-                reply = f"✅ 交易格式、帳款、月份總覽與客戶分析已整理\n日期｜{result['date']}"
+                reply = f"✅ 帳款與客戶分析已整理\n日期｜{result['date']}"
             except Exception:
                 logger.exception("Manual receivables refresh failed")
                 reply = "⚠️ 整理失敗，請稍後再試。"
@@ -1566,10 +1459,10 @@ def handle_message(event):
                 reply = (
                     "❌ 更新格式錯誤\n\n"
                     "正確格式：\n"
-                    "更新 行號 已收\n"
-                    "更新 行號 已付\n"
-                    "更新 行號 部分收 金額\n\n"
-                    "範例：更新 21 已收\n"
+                    "更新 交易編號 已收\n"
+                    "更新 交易編號 已付\n"
+                    "更新 交易編號 部分收 金額\n\n"
+                    "範例：更新 TX-0021 已收\n"
                     "　　　更新 21 部分收 30000"
                 )
             else:
@@ -1577,7 +1470,7 @@ def handle_message(event):
                     wb     = get_workbook()
                     result = apply_status_update(
                         wb,
-                        update_cmd["row"],
+                        update_cmd["tx_id"],
                         update_cmd["status"],
                         update_cmd["collected"],
                     )
@@ -1593,14 +1486,14 @@ def handle_message(event):
                 reply = (
                     "❌ 刪除格式錯誤\n\n"
                     "正確格式：\n"
-                    "刪除 行號\n"
-                    "刪除交易 行號\n\n"
-                    "範例：刪除 25"
+                    "刪除 交易編號\n"
+                    "刪除交易 交易編號\n\n"
+                    "範例：刪除 TX-0025 或 刪除 25"
                 )
             else:
                 try:
                     wb = get_workbook()
-                    result = apply_delete_transaction(wb, delete_cmd["row"])
+                    result = apply_delete_transaction(wb, delete_cmd["tx_id"])
                     reply = format_delete_reply(result) if result["ok"] else f"❌ {result['error']}"
                 except Exception:
                     logger.exception("Delete failed")
@@ -1622,7 +1515,7 @@ def handle_message(event):
             else:
                 try:
                     wb      = get_workbook()
-                    row_num = append_transaction(wb, parsed)
+                    row_num, tx_id = append_transaction(wb, parsed)
                     remember_message(message_id)
                 except Exception:
                     logger.exception("Failed to append transaction")
@@ -1632,9 +1525,8 @@ def handle_message(event):
                     recv_err   = False
                     customer_added = False
                     customer_err = False
-                    monthly_err = False
                     try:
-                        recv_added = update_receivables(wb, parsed, row_num)
+                        recv_added = update_receivables(wb, parsed, tx_id)
                     except Exception:
                         recv_err = True
                         logger.exception("Failed to update receivables")
@@ -1643,19 +1535,12 @@ def handle_message(event):
                     except Exception:
                         customer_err = True
                         logger.exception("Failed to update customer analysis")
-                    try:
-                        refresh_monthly_overview(wb)
-                    except Exception:
-                        monthly_err = True
-                        logger.exception("Failed to refresh monthly overview")
 
-                    reply = format_new_transaction_reply(parsed, row_num, recv_added, customer_added)
+                    reply = format_new_transaction_reply(parsed, tx_id, recv_added, customer_added)
                     if recv_err:
                         reply += "\n⚠️ 交易已記錄，但應收帳款同步失敗。"
                     if customer_err:
                         reply += "\n⚠️ 交易已記錄，但客戶分析同步失敗。"
-                    if monthly_err:
-                        reply += "\n⚠️ 交易已記錄，但月份總覽同步失敗。"
 
         line_api.reply_message(
             ReplyMessageRequest(
