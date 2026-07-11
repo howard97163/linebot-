@@ -688,9 +688,171 @@ def clean_item_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 # ══════════════════════════════════════════════════════════════
-# 新增交易：解析訊息
+# 新增交易：解析訊息（支援標籤格式與原本空格格式）
 # ══════════════════════════════════════════════════════════════
+LABEL_ALIASES = {
+    "類型": "type", "收支": "type",
+    "金額": "amount", "金钱": "amount", "價格": "amount",
+    "品項": "item", "品项": "item", "項目": "item", "商品": "item",
+    "客戶": "customer", "客户": "customer", "廠商": "customer",
+    "厂商": "customer", "供應商": "customer", "對象": "customer",
+    "狀態": "status", "状态": "status", "付款狀態": "status",
+    "日期": "date", "交易日期": "date",
+    "期限": "due", "付款期限": "due", "到期日": "due",
+    "進價": "cost", "进价": "cost", "成本": "cost",
+    "批發價": "wholesale_price", "批發售價": "wholesale_price",
+    "售出批發價": "wholesale_price", "批價": "wholesale_price",
+    "人民幣": "rmb", "人民币": "rmb", "rmb": "rmb", "RMB": "rmb",
+    "已收": "collected", "已收金額": "collected",
+    "備註": "note", "备注": "note",
+}
+
+_LABEL_TOKEN_RE = re.compile(
+    r"(" + "|".join(sorted(map(re.escape, LABEL_ALIASES), key=len, reverse=True)) + r")\s*[：:]"
+)
+
+def is_labeled_format(text: str) -> bool:
+    return bool(_LABEL_TOKEN_RE.search(text))
+
+def extract_labeled_fields(text: str) -> dict:
+    fields = {}
+    matches = list(_LABEL_TOKEN_RE.finditer(text))
+    for idx, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        value = text[start:end].strip().strip("，,、")
+        key = LABEL_ALIASES.get(label)
+        if key and value:
+            fields[key] = value
+    return fields
+
+def parse_labeled_message(text: str) -> dict | None:
+    fields = extract_labeled_fields(text)
+
+    tx_type = fields.get("type", "").strip()
+    if tx_type in ("+",):
+        tx_type = TX_INCOME
+    elif tx_type in ("-",):
+        tx_type = TX_EXPENSE
+    if tx_type not in (TX_INCOME, TX_EXPENSE):
+        return None
+
+    if "amount" not in fields or "item" not in fields:
+        return None
+    try:
+        amount = to_int(fields["amount"])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+
+    item = fields["item"].strip()
+    if not item:
+        return None
+    customer = fields.get("customer", "").strip()
+
+    today = today_tw()
+    tx_date = today
+    if "date" in fields:
+        tx_date = parse_date_value(fields["date"], today.year)
+        if tx_date is None:
+            return None
+
+    status = fields.get("status", "").strip()
+    initial_collected = 0
+    if "collected" in fields:
+        try:
+            initial_collected = to_int(fields["collected"])
+        except ValueError:
+            return None
+        if initial_collected <= 0 or initial_collected >= amount:
+            return None
+        status = STATUS_PARTIAL
+    if status and status not in STATUS_VALUES:
+        return None
+    if not status:
+        status = STATUS_UNPAID if tx_type == TX_INCOME else STATUS_PAID
+    if status == STATUS_PARTIAL and initial_collected == 0:
+        return None
+
+    due_date = add_months(tx_date, 1)
+    if "due" in fields:
+        due_date = parse_date_value(fields["due"], tx_date.year)
+        if due_date is None:
+            return None
+
+    cost_per_unit = 0
+    if "cost" in fields:
+        try:
+            cost_per_unit = to_number(fields["cost"])
+        except ValueError:
+            return None
+
+    wholesale_price = ""
+    if "wholesale_price" in fields:
+        try:
+            wholesale_price = to_number(fields["wholesale_price"])
+        except ValueError:
+            return None
+
+    rmb = ""
+    exchange_rate = ""
+    if "rmb" in fields:
+        try:
+            rmb = to_int(fields["rmb"])
+        except ValueError:
+            return None
+        if rmb > 0:
+            exchange_rate = round(amount / rmb, 2)
+        else:
+            rmb = ""
+
+    qty, unit_price = extract_qty_and_unit_price(item, amount)
+
+    gross_profit = ""
+    if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
+        gross_profit = amount - (cost_per_unit * qty)
+
+    outstanding = amount - initial_collected if status == STATUS_PARTIAL else amount
+    overdue_days = calculate_overdue_days(due_date, outstanding) if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else ""
+    category = guess_category(f"{item} {text}")
+    raw_single_line = " ".join(l.strip() for l in text.splitlines() if l.strip())
+
+    return {
+        "date":           tx_date.strftime("%Y/%m/%d"),
+        "type":           tx_type,
+        "amount":         amount,
+        "item":           item,
+        "customer":       customer,
+        "status":         status,
+        "pay_date":       tx_date.strftime("%Y/%m/%d") if status in PAID_STATUSES else "",
+        "due_date":       due_date.strftime("%Y/%m/%d") if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else "",
+        "initial_collected": initial_collected,
+        "outstanding":    outstanding,
+        "overdue_days":   overdue_days,
+        "qty":            qty,
+        "unit_price":     unit_price,
+        "wholesale_price": wholesale_price,
+        "cost_per_unit":  cost_per_unit,
+        "gross_profit":   gross_profit,
+        "channel":        guess_channel(item, customer, text),
+        "days_to_collect": "",
+        "note":           fields.get("note", ""),
+        "category":       category,
+        "cost_structure": guess_cost_structure(category, tx_type),
+        "month":          f"{tx_date.month}月",
+        "rmb":            rmb,
+        "exchange_rate":  exchange_rate,
+        "raw":            raw_single_line,
+    }
+
 def parse_message(text: str) -> dict | None:
+    if is_labeled_format(text):
+        return parse_labeled_message(text)
+    return parse_spaced_message(text)
+
+def parse_spaced_message(text: str) -> dict | None:
     text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
     tx_date, text = parse_optional_transaction_date(text)
     if tx_date is None:
@@ -1540,6 +1702,18 @@ HELP_TEXT = """溫室帳目機器人
 進價：進價30
 批發售價：批發價120 / 批發售價120 / 批價120
 外匯：人民幣4000 / RMB4000 / 4000 RMB
+
+【標籤格式】
+也可用一行一欄輸入：
+日期：7/1
+類型：支出
+金額：3000
+品項：罰款
+廠商：
+狀態：已付
+
+可用標籤：日期、類型、金額、品項、客戶、廠商、狀態、期限、進價、批發價、人民幣、已收、備註
+標籤格式必填：類型、金額、品項
 
 【自動規則】
 未輸入日期：預設今天
