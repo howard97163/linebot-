@@ -72,6 +72,7 @@ COL_RMB         = 19  # 換匯金額
 COL_EXCHANGE_RATE = 20  # 匯率
 COL_RAW         = 21  # 原始備註
 COL_TX_ID       = 22  # 交易編號（TX-0001，固定不隨排序變動）
+COL_DELETED_AT  = 23  # 刪除日期（軟刪除標記）
 
 # 應收帳款欄位
 RECV_COL_DATE        = 1
@@ -83,6 +84,7 @@ RECV_COL_OUTSTANDING = 6
 RECV_COL_DUE         = 7
 RECV_COL_OVERDUE     = 8
 RECV_COL_NOTE        = 9
+RECV_COL_DELETED_AT  = 10
 
 # 客戶分析欄位
 CUST_COL_NAME        = 1
@@ -96,11 +98,12 @@ RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
 MIN_TRANSACTION_ROW = 3
-TX_LAST_COL = COL_TX_ID
-RECV_LAST_COL = RECV_COL_NOTE
+TX_LAST_COL = COL_DELETED_AT
+RECV_LAST_COL = RECV_COL_DELETED_AT
 MONTHLY_LAST_COL = 19
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
+ROW_COLOR_DELETED = {"red": 0.82, "green": 0.82, "blue": 0.82}
 STATUS_COLOR_PAID = {"red": 0.72, "green": 0.95, "blue": 0.82}
 STATUS_COLOR_UNPAID = {"red": 0.98, "green": 0.82, "blue": 0.82}
 STATUS_COLOR_PARTIAL = {"red": 1.0, "green": 0.93, "blue": 0.68}
@@ -309,6 +312,57 @@ def overdue_background_color(overdue_days):
 def alternating_color_for_row(row_num: int):
     return ROW_COLOR_GREEN if (row_num - MIN_TRANSACTION_ROW) % 2 else ROW_COLOR_WHITE
 
+def is_soft_deleted_row(row: list[str], deleted_col: int) -> bool:
+    return len(row) >= deleted_col and bool(str(row[deleted_col - 1]).strip())
+
+def deleted_at_value(row: list[str], deleted_col: int) -> str:
+    return str(row[deleted_col - 1]).strip() if len(row) >= deleted_col else ""
+
+def deleted_date_from_row(row: list[str], deleted_col: int):
+    value = deleted_at_value(row, deleted_col)
+    return parse_date_value(value) if value else None
+
+def append_row_format_request(sheet, row_num: int, last_col: int, color: dict, requests: list):
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet.id,
+                "startRowIndex": row_num - 1,
+                "endRowIndex": row_num,
+                "startColumnIndex": 0,
+                "endColumnIndex": last_col,
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": color,
+                }
+            },
+            "fields": "userEnteredFormat.backgroundColor",
+        }
+    })
+
+def apply_row_background(sheet, row_num: int, last_col: int, color: dict):
+    requests = []
+    append_row_format_request(sheet, row_num, last_col, color, requests)
+    sheet.spreadsheet.batch_update({"requests": requests})
+
+def apply_deleted_row_format(sheet, row_num: int, last_col: int):
+    apply_row_background(sheet, row_num, last_col, ROW_COLOR_DELETED)
+
+def apply_soft_deleted_formats(sheet, deleted_col: int, last_col: int):
+    values = sheet.get_all_values()
+    end_row = last_data_row(values)
+    total_row = find_total_row(values)
+    if total_row:
+        end_row = min(end_row, total_row - 1)
+    requests = []
+    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
+        row = values[row_num - 1] if len(values) >= row_num else []
+        if is_soft_deleted_row(row, deleted_col):
+            append_row_format_request(sheet, row_num, last_col, ROW_COLOR_DELETED, requests)
+    if requests:
+        sheet.spreadsheet.batch_update({"requests": requests})
+
 def transaction_status_background(status: str):
     if status in (STATUS_PAID, STATUS_COLLECTED):
         return STATUS_COLOR_PAID
@@ -331,10 +385,11 @@ def refresh_receivable_totals(sheet):
         return
 
     last_detail_row = total_row - 1
+    deleted_col_letter = column_letter(RECV_COL_DELETED_AT)
     sheet.batch_update([
-        {"range": f"D{total_row}", "values": [[f"=SUM(D{MIN_TRANSACTION_ROW}:D{last_detail_row})"]]},
-        {"range": f"E{total_row}", "values": [[f"=SUM(E{MIN_TRANSACTION_ROW}:E{last_detail_row})"]]},
-        {"range": f"F{total_row}", "values": [[f"=SUM(F{MIN_TRANSACTION_ROW}:F{last_detail_row})"]]},
+        {"range": f"D{total_row}", "values": [[f"=SUMIF({deleted_col_letter}{MIN_TRANSACTION_ROW}:{deleted_col_letter}{last_detail_row},\"\",D{MIN_TRANSACTION_ROW}:D{last_detail_row})"]]},
+        {"range": f"E{total_row}", "values": [[f"=SUMIF({deleted_col_letter}{MIN_TRANSACTION_ROW}:{deleted_col_letter}{last_detail_row},\"\",E{MIN_TRANSACTION_ROW}:E{last_detail_row})"]]},
+        {"range": f"F{total_row}", "values": [[f"=SUMIF({deleted_col_letter}{MIN_TRANSACTION_ROW}:{deleted_col_letter}{last_detail_row},\"\",F{MIN_TRANSACTION_ROW}:F{last_detail_row})"]]},
     ], value_input_option="USER_ENTERED")
 
 def last_data_row(values: list[list[str]], date_col: int = 1) -> int:
@@ -415,6 +470,7 @@ def apply_transaction_status_formats(sheet):
 def refresh_transaction_formats(sheet):
     apply_alternating_row_colors(sheet, TX_LAST_COL)
     apply_transaction_status_formats(sheet)
+    apply_soft_deleted_formats(sheet, COL_DELETED_AT, TX_LAST_COL)
 
 def apply_alternating_row_colors_to(sheet, last_col: int, end_row: int):
     if end_row < MIN_TRANSACTION_ROW:
@@ -456,6 +512,9 @@ def refresh_receivable_overdue_formats(sheet):
     format_requests = []
     for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
         row = values[row_num - 1] if len(values) >= row_num else []
+        if is_soft_deleted_row(row, RECV_COL_DELETED_AT):
+            append_row_format_request(sheet, row_num, RECV_LAST_COL, ROW_COLOR_DELETED, format_requests)
+            continue
         outstanding = 0
         due_date = None
         try:
@@ -473,23 +532,7 @@ def refresh_receivable_overdue_formats(sheet):
             if existing_overdue_days:
                 color = overdue_background_color(existing_overdue_days)
                 if color:
-                    format_requests.append({
-                        "repeatCell": {
-                            "range": {
-                                "sheetId": sheet.id,
-                                "startRowIndex": row_num - 1,
-                                "endRowIndex": row_num,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": RECV_LAST_COL,
-                            },
-                            "cell": {
-                                "userEnteredFormat": {
-                                    "backgroundColor": color,
-                                }
-                            },
-                            "fields": "userEnteredFormat.backgroundColor",
-                        }
-                    })
+                    append_row_format_request(sheet, row_num, RECV_LAST_COL, color, format_requests)
             continue
         overdue_days = calculate_overdue_days(due_date, outstanding)
         if overdue_days:
@@ -499,23 +542,7 @@ def refresh_receivable_overdue_formats(sheet):
             })
             color = overdue_background_color(overdue_days)
             if color:
-                format_requests.append({
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet.id,
-                            "startRowIndex": row_num - 1,
-                            "endRowIndex": row_num,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": RECV_LAST_COL,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": color,
-                            }
-                        },
-                        "fields": "userEnteredFormat.backgroundColor",
-                    }
-                })
+                append_row_format_request(sheet, row_num, RECV_LAST_COL, color, format_requests)
 
     if overdue_updates:
         sheet.batch_update(overdue_updates)
@@ -526,25 +553,7 @@ def apply_receivable_row_format(sheet, row_num: int, overdue_days=""):
     color = overdue_background_color(overdue_days) if overdue_days else None
     if not color:
         color = alternating_color_for_row(row_num)
-    sheet.spreadsheet.batch_update({
-        "requests": [{
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet.id,
-                    "startRowIndex": row_num - 1,
-                    "endRowIndex": row_num,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": RECV_LAST_COL,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": color,
-                    }
-                },
-                "fields": "userEnteredFormat.backgroundColor",
-            }
-        }]
-    })
+    apply_row_background(sheet, row_num, RECV_LAST_COL, color)
 
 def find_transaction_row(sheet, data: dict) -> int:
     values = sheet.get_all_values()
@@ -1049,6 +1058,15 @@ def parse_delete_command(text: str) -> dict | None:
         return None
     return {"tx_id": tx_id}
 
+def parse_restore_command(text: str) -> dict | None:
+    m = re.match(r"^恢復(?:交易(?:紀錄|記錄)?)?\s+(TX-?\d+|\d+)$", text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    tx_id = normalize_tx_id(m.group(1))
+    if tx_id is None:
+        return None
+    return {"tx_id": tx_id}
+
 def receivable_note(raw: str, tx_id: str) -> str:
     return f"[{tx_id}] {raw}".strip()
 
@@ -1092,6 +1110,8 @@ def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) 
 
     if not row_data or len(row_data) < COL_AMOUNT:
         return {"ok": False, "error": f"找不到交易編號 {tx_id} 的資料，請確認試算表"}
+    if is_soft_deleted_row(row_data, COL_DELETED_AT):
+        return {"ok": False, "error": f"交易 {tx_id} 已標記刪除，若要更新請先輸入「恢復 {tx_id}」"}
 
     orig_date_str = row_data[COL_DATE - 1]
     tx_type  = row_data[COL_TYPE - 1] if len(row_data) >= COL_TYPE else ""
@@ -1233,6 +1253,8 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
     customer = row_data[COL_CUSTOMER - 1] if len(row_data) >= COL_CUSTOMER else ""
     amount_str = row_data[COL_AMOUNT - 1] if len(row_data) >= COL_AMOUNT else "0"
     raw = row_data[COL_RAW - 1] if len(row_data) >= COL_RAW else ""
+    if is_soft_deleted_row(row_data, COL_DELETED_AT):
+        return {"ok": False, "error": f"交易 {tx_id} 已經是灰色刪除狀態"}
     try:
         amount = to_int(amount_str) if amount_str else 0
     except ValueError:
@@ -1241,6 +1263,7 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
     if tx_type not in (TX_INCOME, TX_EXPENSE):
         return {"ok": False, "error": "此列不是有效的交易資料列"}
 
+    deleted_at = today_tw().strftime("%Y/%m/%d")
     recv_deleted = False
     recv_row = None
     if tx_type == TX_INCOME:
@@ -1249,15 +1272,79 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
             all_recv = recv_sheet.get_all_values()
             recv_row = find_receivable_row(all_recv, tx_id, customer, item, amount, raw)
             if recv_row:
-                recv_sheet.delete_rows(recv_row)
+                recv_sheet.batch_update([
+                    {"range": cell_a1(recv_row, RECV_COL_DELETED_AT), "values": [[deleted_at]]},
+                ])
+                apply_deleted_row_format(recv_sheet, recv_row, RECV_LAST_COL)
+                refresh_receivable_totals(recv_sheet)
                 recv_deleted = True
         except Exception:
             logger.exception("Failed to delete related receivable")
-            return {"ok": False, "error": "找到交易資料，但刪除對應應收帳款時失敗，請稍後再試"}
+            return {"ok": False, "error": "找到交易資料，但標記對應應收帳款時失敗，請稍後再試"}
 
-    tx_sheet.delete_rows(row_num)
-    sort_sheet_by_date(tx_sheet, TX_LAST_COL)
+    tx_sheet.batch_update([
+        {"range": cell_a1(row_num, COL_DELETED_AT), "values": [[deleted_at]]},
+    ])
+    apply_deleted_row_format(tx_sheet, row_num, TX_LAST_COL)
+
+    return {
+        "ok": True,
+        "tx_id": tx_id,
+        "row_num": row_num,
+        "deleted_at": deleted_at,
+        "type": tx_type,
+        "item": item,
+        "customer": customer,
+        "amount": amount,
+        "recv_deleted": recv_deleted,
+        "recv_row": recv_row,
+    }
+
+def apply_restore_transaction(wb, tx_id: str) -> dict:
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    if not row_num or row_num < MIN_TRANSACTION_ROW:
+        return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
+    row_data = tx_sheet.row_values(row_num)
+    if not row_data or len(row_data) < COL_AMOUNT:
+        return {"ok": False, "error": f"找不到交易編號 {tx_id} 的資料，請確認試算表"}
+    if not is_soft_deleted_row(row_data, COL_DELETED_AT):
+        return {"ok": False, "error": f"交易 {tx_id} 目前不是灰色刪除狀態"}
+
+    tx_type = row_data[COL_TYPE - 1] if len(row_data) >= COL_TYPE else ""
+    item = row_data[COL_ITEM - 1] if len(row_data) >= COL_ITEM else ""
+    customer = row_data[COL_CUSTOMER - 1] if len(row_data) >= COL_CUSTOMER else ""
+    amount_str = row_data[COL_AMOUNT - 1] if len(row_data) >= COL_AMOUNT else "0"
+    raw = row_data[COL_RAW - 1] if len(row_data) >= COL_RAW else ""
+    try:
+        amount = to_int(amount_str) if amount_str else 0
+    except ValueError:
+        return {"ok": False, "error": "此列金額格式不正確，請先檢查試算表"}
+
+    tx_sheet.batch_update([
+        {"range": cell_a1(row_num, COL_DELETED_AT), "values": [[""]]},
+    ])
     refresh_transaction_formats(tx_sheet)
+
+    recv_restored = False
+    recv_row = None
+    if tx_type == TX_INCOME:
+        try:
+            recv_sheet = wb.worksheet(SHEET_RECEIVABLES)
+            all_recv = recv_sheet.get_all_values()
+            recv_row = find_receivable_row(all_recv, tx_id, customer, item, amount, raw)
+            if recv_row:
+                recv_data = all_recv[recv_row - 1] if len(all_recv) >= recv_row else []
+                overdue = recv_data[RECV_COL_OVERDUE - 1] if len(recv_data) >= RECV_COL_OVERDUE else ""
+                recv_sheet.batch_update([
+                    {"range": cell_a1(recv_row, RECV_COL_DELETED_AT), "values": [[""]]},
+                ])
+                apply_receivable_row_format(recv_sheet, recv_row, overdue)
+                refresh_receivable_totals(recv_sheet)
+                recv_restored = True
+        except Exception:
+            logger.exception("Failed to restore related receivable")
+            return {"ok": False, "error": "交易已恢復，但恢復對應應收帳款時失敗，請稍後再輸入「整理」確認"}
 
     return {
         "ok": True,
@@ -1267,9 +1354,27 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
         "item": item,
         "customer": customer,
         "amount": amount,
-        "recv_deleted": recv_deleted,
+        "recv_restored": recv_restored,
         "recv_row": recv_row,
     }
+
+def purge_soft_deleted_rows(sheet, deleted_col: int, retention_days: int = 30) -> int:
+    values = sheet.get_all_values()
+    total_row = find_total_row(values)
+    end_row = last_data_row(values)
+    if total_row:
+        end_row = min(end_row, total_row - 1)
+    cutoff = today_tw() - timedelta(days=retention_days)
+    rows_to_delete = []
+    for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
+        row = values[row_num - 1] if len(values) >= row_num else []
+        deleted_date = deleted_date_from_row(row, deleted_col)
+        if deleted_date and deleted_date <= cutoff:
+            rows_to_delete.append(row_num)
+
+    for row_num in sorted(rows_to_delete, reverse=True):
+        sheet.delete_rows(row_num)
+    return len(rows_to_delete)
 
 # ══════════════════════════════════════════════════════════════
 # 寫入新交易
@@ -1284,7 +1389,7 @@ def append_transaction(wb, data: dict) -> tuple[int, str]:
         data["qty"], data["unit_price"], data["wholesale_price"], data["cost_per_unit"],
         data["gross_profit"], data["channel"], data["days_to_collect"],
         data["note"], data["category"], data["cost_structure"],
-        data["month"], data["rmb"], data["exchange_rate"], data["raw"], tx_id,
+        data["month"], data["rmb"], data["exchange_rate"], data["raw"], tx_id, "",
     ]
     sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
     sorted_row_num = organize_transaction_sheet(sheet, data)
@@ -1309,7 +1414,7 @@ def update_receivables(wb, data: dict, tx_id: str) -> bool:
     sheet.insert_row(
         [data["date"], data["customer"], data["item"],
          data["amount"], data["initial_collected"], data["outstanding"],
-         data["due_date"], data["overdue_days"], receivable_note(data["raw"], tx_id)],
+         data["due_date"], data["overdue_days"], receivable_note(data["raw"], tx_id), ""],
         insert_at,
         value_input_option="RAW",
     )
@@ -1323,6 +1428,8 @@ def customer_analysis_stats(wb) -> dict:
     stats = {}
 
     for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
+        if is_soft_deleted_row(row, COL_DELETED_AT):
+            continue
         tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
         if tx_type != TX_INCOME:
             continue
@@ -1356,6 +1463,8 @@ def customer_analysis_stats(wb) -> dict:
         total_row = find_total_row(recv_values)
         end_index = (total_row - 1) if total_row else len(recv_values)
         for row in recv_values[MIN_TRANSACTION_ROW - 1:end_index]:
+            if is_soft_deleted_row(row, RECV_COL_DELETED_AT):
+                continue
             customer = row[RECV_COL_CUSTOMER - 1].strip() if len(row) >= RECV_COL_CUSTOMER and row[RECV_COL_CUSTOMER - 1] else ""
             if not customer:
                 continue
@@ -1454,6 +1563,8 @@ def refresh_monthly_overview(wb) -> bool:
     monthly = {month: monthly_summary_empty_stats() for month in range(1, 13)}
 
     for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
+        if is_soft_deleted_row(row, COL_DELETED_AT):
+            continue
         date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
         tx_date = parse_date_value(str(date_text)) if date_text else None
         if not tx_date:
@@ -1510,6 +1621,8 @@ def refresh_monthly_overview(wb) -> bool:
         total_row = find_total_row(recv_values)
         end_index = (total_row - 1) if total_row else len(recv_values)
         for row in recv_values[MIN_TRANSACTION_ROW - 1:end_index]:
+            if is_soft_deleted_row(row, RECV_COL_DELETED_AT):
+                continue
             date_text = row[RECV_COL_DATE - 1] if len(row) >= RECV_COL_DATE else ""
             recv_date = parse_date_value(str(date_text)) if date_text else None
             if not recv_date:
@@ -1683,7 +1796,25 @@ def format_update_reply(result: dict) -> str:
 
 def format_delete_reply(result: dict) -> str:
     lines = [
-        f"🗑️ 已刪除交易 {result['tx_id']}",
+        f"🗑️ 交易 {result['tx_id']} 已標記刪除",
+        "─" * 22,
+        f"編號｜{result['tx_id']}",
+        f"刪除日期｜{result['deleted_at']}",
+        f"類型｜{result['type']}",
+        f"金額｜NT$ {result['amount']:,}",
+        f"品項｜{result['item']}",
+    ]
+    if result["customer"]:
+        lines.append(f"客戶｜{result['customer']}")
+    if result["recv_deleted"]:
+        lines.append("📌 對應應收帳款已一併標記刪除")
+    lines.append("30 天後會由「整理」或每日排程自動移除")
+    lines.append(f"若要復原請輸入：恢復 {result['tx_id']}")
+    return "\n".join(lines)
+
+def format_restore_reply(result: dict) -> str:
+    lines = [
+        f"↩️ 交易 {result['tx_id']} 已恢復",
         "─" * 22,
         f"編號｜{result['tx_id']}",
         f"類型｜{result['type']}",
@@ -1692,8 +1823,9 @@ def format_delete_reply(result: dict) -> str:
     ]
     if result["customer"]:
         lines.append(f"客戶｜{result['customer']}")
-    if result["recv_deleted"]:
-        lines.append("📌 對應應收帳款已一併刪除")
+    if result["recv_restored"]:
+        lines.append("📌 對應應收帳款已一併恢復")
+    lines.append("報表會在「整理」或每日排程後重新納入統計")
     return "\n".join(lines)
 
 HELP_TEXT = """溫室帳目機器人
@@ -1785,13 +1917,19 @@ HELP_TEXT = """溫室帳目機器人
 刪除範例：
 刪除 TX-0025
 刪除交易 TX-0025
-刪除 25"""
+刪除 25
+
+刪除會先標成灰色並填入刪除日期，30天後由「整理」或每日排程移除。
+30天內可輸入：恢復 TX-0025"""
 
 def refresh_receivables_job() -> dict:
     wb = get_workbook()
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
     sheet = wb.worksheet(SHEET_RECEIVABLES)
     ids_added = ensure_transaction_ids(tx_sheet)
+    purged_transactions = purge_soft_deleted_rows(tx_sheet, COL_DELETED_AT)
+    purged_receivables = purge_soft_deleted_rows(sheet, RECV_COL_DELETED_AT)
+    sort_sheet_by_date(tx_sheet, TX_LAST_COL)
     refresh_transaction_formats(tx_sheet)
     sort_sheet_by_date(sheet, RECV_LAST_COL)
     refresh_receivable_overdue_formats(sheet)
@@ -1802,6 +1940,8 @@ def refresh_receivables_job() -> dict:
         "ok": True,
         "date": today_tw().strftime("%Y/%m/%d"),
         "ids_added": ids_added,
+        "purged_transactions": purged_transactions,
+        "purged_receivables": purged_receivables,
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -1836,6 +1976,8 @@ def refresh_receivables_route():
             "status": "ok",
             "date": result["date"],
             "ids_added": result.get("ids_added", 0),
+            "purged_transactions": result.get("purged_transactions", 0),
+            "purged_receivables": result.get("purged_receivables", 0),
         }
     except Exception:
         logger.exception("Scheduled receivables refresh failed")
@@ -1861,7 +2003,9 @@ def handle_message(event):
                 reply = (
                     "✅ 交易格式、帳款、月份總覽與客戶分析已整理\n"
                     f"日期｜{result['date']}\n"
-                    f"補上交易編號｜{result.get('ids_added', 0)} 筆"
+                    f"補上交易編號｜{result.get('ids_added', 0)} 筆\n"
+                    f"移除逾期刪除交易｜{result.get('purged_transactions', 0)} 筆\n"
+                    f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆"
                 )
             except Exception:
                 logger.exception("Manual receivables refresh failed")
@@ -1894,6 +2038,27 @@ def handle_message(event):
                 except Exception:
                     logger.exception("Update failed")
                     reply = "⚠️ 更新失敗，請稍後再試。"
+
+        # ── 恢復軟刪除交易 ──────────────────────────────────────
+        elif user_text.startswith("恢復"):
+            restore_cmd = parse_restore_command(user_text)
+            if restore_cmd is None:
+                reply = (
+                    "❌ 恢復格式錯誤\n\n"
+                    "正確格式：\n"
+                    "恢復 交易編號\n"
+                    "恢復交易 交易編號\n\n"
+                    "範例：恢復 TX-0025\n"
+                    "也可簡寫：恢復 25"
+                )
+            else:
+                try:
+                    wb = get_workbook()
+                    result = apply_restore_transaction(wb, restore_cmd["tx_id"])
+                    reply = format_restore_reply(result) if result["ok"] else f"❌ {result['error']}"
+                except Exception:
+                    logger.exception("Restore failed")
+                    reply = "⚠️ 恢復失敗，請稍後再試。"
 
         # ── 刪除交易紀錄 ────────────────────────────────────────
         elif user_text.startswith("刪除"):
