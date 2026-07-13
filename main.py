@@ -1314,6 +1314,7 @@ def update_receivables(wb, data: dict, tx_id: str) -> bool:
         value_input_option="RAW",
     )
     apply_receivable_row_format(sheet, insert_at, data["overdue_days"])
+    refresh_receivable_totals(sheet)
     return True
 
 def customer_analysis_stats(wb) -> dict:
