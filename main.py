@@ -306,20 +306,8 @@ def overdue_background_color(overdue_days):
         return {"red": 1.0, "green": 0.96, "blue": 0.65}
     return None
 
-def apply_receivable_overdue_format(sheet, row_num: int, overdue_days):
-    color = overdue_background_color(overdue_days)
-    if not color:
-        return
-    sheet.format(f"A{row_num}:I{row_num}", {"backgroundColor": color})
-
 def alternating_color_for_row(row_num: int):
     return ROW_COLOR_GREEN if (row_num - MIN_TRANSACTION_ROW) % 2 else ROW_COLOR_WHITE
-
-def clear_receivable_overdue_format(sheet, row_num: int):
-    sheet.format(
-        f"A{row_num}:I{row_num}",
-        {"backgroundColor": alternating_color_for_row(row_num)},
-    )
 
 def transaction_status_background(status: str):
     if status in (STATUS_PAID, STATUS_COLLECTED):
@@ -463,6 +451,9 @@ def refresh_receivable_overdue_formats(sheet):
     total_row = find_total_row(values)
     if total_row:
         end_row = min(end_row, total_row - 1)
+
+    overdue_updates = []
+    format_requests = []
     for row_num in range(MIN_TRANSACTION_ROW, end_row + 1):
         row = values[row_num - 1] if len(values) >= row_num else []
         outstanding = 0
@@ -480,15 +471,80 @@ def refresh_receivable_overdue_formats(sheet):
             except ValueError:
                 existing_overdue_days = ""
             if existing_overdue_days:
-                apply_receivable_overdue_format(sheet, row_num, existing_overdue_days)
+                color = overdue_background_color(existing_overdue_days)
+                if color:
+                    format_requests.append({
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet.id,
+                                "startRowIndex": row_num - 1,
+                                "endRowIndex": row_num,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": RECV_LAST_COL,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "backgroundColor": color,
+                                }
+                            },
+                            "fields": "userEnteredFormat.backgroundColor",
+                        }
+                    })
             continue
         overdue_days = calculate_overdue_days(due_date, outstanding)
         if overdue_days:
-            sheet.update_cell(row_num, RECV_COL_OVERDUE, overdue_days)
-            apply_receivable_overdue_format(sheet, row_num, overdue_days)
-        else:
-            clear_receivable_overdue_format(sheet, row_num)
-    refresh_receivable_totals(sheet)
+            overdue_updates.append({
+                "range": cell_a1(row_num, RECV_COL_OVERDUE),
+                "values": [[overdue_days]],
+            })
+            color = overdue_background_color(overdue_days)
+            if color:
+                format_requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet.id,
+                            "startRowIndex": row_num - 1,
+                            "endRowIndex": row_num,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": RECV_LAST_COL,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": color,
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                })
+
+    if overdue_updates:
+        sheet.batch_update(overdue_updates)
+    if format_requests:
+        sheet.spreadsheet.batch_update({"requests": format_requests})
+
+def apply_receivable_row_format(sheet, row_num: int, overdue_days=""):
+    color = overdue_background_color(overdue_days) if overdue_days else None
+    if not color:
+        color = alternating_color_for_row(row_num)
+    sheet.spreadsheet.batch_update({
+        "requests": [{
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": row_num - 1,
+                    "endRowIndex": row_num,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": RECV_LAST_COL,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": color,
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        }]
+    })
 
 def find_transaction_row(sheet, data: dict) -> int:
     values = sheet.get_all_values()
@@ -1087,6 +1143,11 @@ def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) 
             recv_data = all_recv[recv_row - 1] if len(all_recv) >= recv_row else []
             due_date_str = recv_data[RECV_COL_DUE - 1] if len(recv_data) >= RECV_COL_DUE else ""
             due_date = parse_date_value(due_date_str) if due_date_str else None
+            existing_overdue_text = recv_data[RECV_COL_OVERDUE - 1] if len(recv_data) >= RECV_COL_OVERDUE else ""
+            try:
+                existing_overdue_days = to_int(existing_overdue_text) if existing_overdue_text else ""
+            except ValueError:
+                existing_overdue_days = ""
             if new_status == STATUS_COLLECTED:
                 # 全額已收
                 recv_sheet.batch_update([
@@ -1094,6 +1155,8 @@ def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) 
                     {"range": f"F{recv_row}", "values": [[0]]},
                     {"range": f"I{recv_row}", "values": [[receivable_note(raw, tx_id)]]},
                 ])
+                if existing_overdue_days:
+                    apply_receivable_row_format(recv_sheet, recv_row, existing_overdue_days)
                 recv_updated = True
             elif new_status == STATUS_PARTIAL:
                 # 部分收款：輸入金額視為「本次收款」，需累加到既有已收金額。
@@ -1130,24 +1193,14 @@ def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) 
                 if outstanding > 0:
                     receivable_updates.append({"range": f"H{recv_row}", "values": [[overdue_days]]})
                 recv_sheet.batch_update(receivable_updates)
-                if outstanding > 0:
-                    if overdue_days:
-                        apply_receivable_overdue_format(recv_sheet, recv_row, overdue_days)
-                    else:
-                        clear_receivable_overdue_format(recv_sheet, recv_row)
+                apply_receivable_row_format(
+                    recv_sheet,
+                    recv_row,
+                    overdue_days if outstanding > 0 else existing_overdue_days,
+                )
                 recv_updated = True
-        refresh_receivable_overdue_formats(recv_sheet)
     except Exception:
         logger.exception("Failed to update receivables during status update")
-    if tx_type == TX_INCOME:
-        try:
-            refresh_customer_analysis(wb)
-        except Exception:
-            logger.exception("Failed to refresh customer analysis during status update")
-    try:
-        refresh_monthly_overview(wb)
-    except Exception:
-        logger.exception("Failed to refresh monthly overview during status update")
 
     return {
         "ok":           True,
@@ -1205,19 +1258,6 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
     tx_sheet.delete_rows(row_num)
     sort_sheet_by_date(tx_sheet, TX_LAST_COL)
     refresh_transaction_formats(tx_sheet)
-    if tx_type == TX_INCOME:
-        try:
-            refresh_receivable_overdue_formats(wb.worksheet(SHEET_RECEIVABLES))
-        except Exception:
-            logger.exception("Failed to refresh receivables after deletion")
-        try:
-            refresh_customer_analysis(wb)
-        except Exception:
-            logger.exception("Failed to refresh customer analysis after deletion")
-    try:
-        refresh_monthly_overview(wb)
-    except Exception:
-        logger.exception("Failed to refresh monthly overview after deletion")
 
     return {
         "ok": True,
@@ -1273,8 +1313,7 @@ def update_receivables(wb, data: dict, tx_id: str) -> bool:
         insert_at,
         value_input_option="RAW",
     )
-    sort_sheet_by_date(sheet, RECV_LAST_COL)
-    refresh_receivable_overdue_formats(sheet)
+    apply_receivable_row_format(sheet, insert_at, data["overdue_days"])
     return True
 
 def customer_analysis_stats(wb) -> dict:
@@ -1721,7 +1760,7 @@ HELP_TEXT = """溫室帳目機器人
 支出未輸入狀態：預設已付
 已收/已付：付款日期預設為交易日期
 未付/部分收收入：自動同步應收帳款
-收入的新客戶：自動加入客戶分析
+客戶分析與月份總覽：輸入「整理」或每日排程時更新
 每筆交易會自動產生固定交易編號，例如 TX-0001
 更新與刪除請用交易編號，排序後也不會更新錯筆
 
@@ -1753,7 +1792,9 @@ def refresh_receivables_job() -> dict:
     sheet = wb.worksheet(SHEET_RECEIVABLES)
     ids_added = ensure_transaction_ids(tx_sheet)
     refresh_transaction_formats(tx_sheet)
+    sort_sheet_by_date(sheet, RECV_LAST_COL)
     refresh_receivable_overdue_formats(sheet)
+    refresh_receivable_totals(sheet)
     refresh_customer_analysis(wb)
     refresh_monthly_overview(wb)
     return {
@@ -1898,32 +1939,15 @@ def handle_message(event):
                 else:
                     recv_added = False
                     recv_err   = False
-                    customer_added = False
-                    customer_err = False
-                    monthly_err = False
                     try:
                         recv_added = update_receivables(wb, parsed, tx_id)
                     except Exception:
                         recv_err = True
                         logger.exception("Failed to update receivables")
-                    try:
-                        customer_added = update_customer_analysis(wb, parsed)
-                    except Exception:
-                        customer_err = True
-                        logger.exception("Failed to update customer analysis")
-                    try:
-                        refresh_monthly_overview(wb)
-                    except Exception:
-                        monthly_err = True
-                        logger.exception("Failed to refresh monthly overview")
 
-                    reply = format_new_transaction_reply(parsed, tx_id, recv_added, customer_added)
+                    reply = format_new_transaction_reply(parsed, tx_id, recv_added)
                     if recv_err:
                         reply += "\n⚠️ 交易已記錄，但應收帳款同步失敗。"
-                    if customer_err:
-                        reply += "\n⚠️ 交易已記錄，但客戶分析同步失敗。"
-                    if monthly_err:
-                        reply += "\n⚠️ 交易已記錄，但月份總覽同步失敗。"
 
         line_api.reply_message(
             ReplyMessageRequest(
