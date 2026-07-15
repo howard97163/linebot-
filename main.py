@@ -602,7 +602,7 @@ def remember_message(mid):
 # 分類字典
 # ══════════════════════════════════════════════════════════════
 CATEGORIES = {
-    "顆":"種苗銷售","盒":"種苗銷售","株":"種苗銷售",
+    "顆":"種苗銷售","盒":"種苗銷售","株":"種苗銷售","棵":"種苗銷售",
     "珍妮":"種苗銷售","侏儒":"種苗銷售","斑葉":"種苗銷售",
     "黃月":"種苗銷售","神鉅":"種苗銷售","妙蛙":"種苗銷售",
     "火鶴":"種苗銷售","鹿角":"種苗銷售","爆米花":"種苗銷售",
@@ -901,7 +901,7 @@ def parse_labeled_message(text: str) -> dict | None:
         "unit_price":     unit_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
-        "channel":        guess_channel(item, customer, text),
+        "channel":        guess_channel(item, customer, text) if tx_type == TX_INCOME else "",
         "days_to_collect": "",
         "note":           fields.get("note", ""),
         "category":       category,
@@ -1026,7 +1026,7 @@ def parse_spaced_message(text: str) -> dict | None:
         "unit_price":     unit_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
-        "channel":        guess_channel(item, customer, text),
+        "channel":        guess_channel(item, customer, text) if tx_type == TX_INCOME else "",
         "days_to_collect": "",
         "note":           "",
         "category":       category,
@@ -1041,13 +1041,15 @@ def parse_spaced_message(text: str) -> dict | None:
 # 更新付款狀態：解析指令
 # 格式：更新 交易編號 已收／已付／部分收 [本次收款金額]
 # 範例：更新 TX-0021 已收
+#       更新 TX-0021 已收 30000
 #       更新 21 部分收 30000
 # ══════════════════════════════════════════════════════════════
 def parse_update_command(text: str) -> dict | None:
+    normalized_text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
     m = re.match(
         rf"^更新\s+(TX-?\d+|\d+)\s+({STATUS_COLLECTED}|{STATUS_PAID}|{STATUS_PARTIAL})"
-        rf"(?:\s+([\d,]+))?$",
-        text.strip(),
+        rf"(?:\s*[：:]?\s*({NUMBER_PATTERN}))?$",
+        normalized_text,
         re.IGNORECASE,
     )
     if not m:
@@ -1057,6 +1059,8 @@ def parse_update_command(text: str) -> dict | None:
         return None
     status = m.group(2)
     collected = to_int(m.group(3)) if m.group(3) else None
+    if status == STATUS_COLLECTED and collected is not None:
+        status = STATUS_PARTIAL
     if status == STATUS_PARTIAL and (collected is None or collected <= 0):
         return None
     return {
@@ -1902,15 +1906,19 @@ HELP_TEXT = """溫室帳目機器人
 
 【更新付款狀態】
 更新 交易編號 已收
+更新 交易編號 已收 本次收款金額
 更新 交易編號 已付
 更新 交易編號 部分收 本次收款金額
 
 更新範例：
 更新 TX-0021 已收
+更新 TX-0021 已收 30000
 更新 TX-0021 已付
 更新 TX-0021 部分收 30000
 更新 21 已收
-部分收會累加到既有已收金額；累計達全額時會自動結清
+已收後面不填金額：視為全額收回
+已收後面有金額：視為本次收款，會累加到既有已收金額；累計達全額時會自動結清
+部分收 金額：保留相容舊寫法，效果同「已收 金額」
 
 【刪除交易】
 刪除 交易編號
@@ -2025,9 +2033,11 @@ def handle_message(event):
                     "❌ 更新格式錯誤\n\n"
                     "正確格式：\n"
                     "更新 交易編號 已收\n"
+                    "更新 交易編號 已收 金額\n"
                     "更新 交易編號 已付\n"
                     "更新 交易編號 部分收 金額\n\n"
                     "範例：更新 TX-0021 已收\n"
+                    "　　　更新 TX-0021 已收 30000\n"
                     "　　　更新 TX-0021 部分收 30000\n"
                     "也可簡寫：更新 21 已收"
                 )
