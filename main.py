@@ -59,20 +59,19 @@ COL_STATUS      = 6   # 付款狀態
 COL_PAY_DATE    = 7   # 付款日期
 COL_QTY         = 8   # 數量
 COL_UNIT_PRICE  = 9   # 售出單價
-COL_WHOLESALE_PRICE = 10  # 售出批發價
-COL_COST        = 11  # 進貨單價
-COL_PROFIT      = 12  # 毛利
-COL_CHANNEL     = 13  # 銷售管道
-COL_DAYS        = 14  # 收款天數
-COL_NOTE        = 15  # 備註
-COL_CATEGORY    = 16  # 分類
-COL_COST_STRUCT = 17  # 支出成本結構
-COL_MONTH       = 18  # 月份
-COL_RMB         = 19  # 換匯金額
-COL_EXCHANGE_RATE = 20  # 匯率
-COL_RAW         = 21  # 原始備註
-COL_TX_ID       = 22  # 交易編號（TX-0001，固定不隨排序變動）
-COL_DELETED_AT  = 23  # 刪除日期（軟刪除標記）
+COL_COST        = 10  # 進貨單價
+COL_PROFIT      = 11  # 毛利
+COL_CHANNEL     = 12  # 銷售管道
+COL_DAYS        = 13  # 收款天數
+COL_NOTE        = 14  # 備註
+COL_CATEGORY    = 15  # 分類
+COL_COST_STRUCT = 16  # 支出成本結構
+COL_MONTH       = 17  # 月份
+COL_RMB         = 18  # 換匯金額
+COL_EXCHANGE_RATE = 19  # 匯率
+COL_RAW         = 20  # 原始備註
+COL_TX_ID       = 21  # 交易編號（TX-0001，固定不隨排序變動）
+COL_DELETED_AT  = 22  # 刪除日期（軟刪除標記）
 
 # 應收帳款欄位
 RECV_COL_DATE        = 1
@@ -610,6 +609,8 @@ CATEGORIES = {
     "白怪":"種苗銷售","紅水晶":"種苗銷售","聖靈":"種苗銷售",
     "粉斑":"種苗銷售","豆豆龍":"種苗銷售","nano":"種苗銷售",
     "omg":"種苗銷售","delta":"種苗銷售","戰鬥機":"種苗銷售",
+    "愛心氣球":"種苗銷售","白斑犀牛皮":"種苗銷售",
+    "斑葉橘柄":"種苗銷售","斑葉神巨":"種苗銷售",
     "種苗":"種苗銷售","植物":"種苗銷售",
     # 物流/包材
     "運費":"一般運費","空軍":"空軍物流","黑貓":"黑貓宅配","郵局":"郵局寄送",
@@ -626,7 +627,6 @@ CATEGORIES = {
     "維修":"設備維修","修理":"設備維修","零件":"設備零件",
     "馬達":"馬達","風扇":"風扇","水泵":"水泵","噴頭":"噴頭","管線":"管線",
     "農藥":"農藥","肥料":"肥料",
-    "711":"7-11活動","福袋":"福袋活動",
     # 進出口
     "檢疫":"檢疫","關稅":"關稅",
     "罰金":"罰金","出口":"出口費用",
@@ -636,9 +636,6 @@ CATEGORIES = {
     "接機":"接機","機加酒":"機加酒",
     # 餐飲交際
     "晚餐":"晚餐","尾牙":"尾牙","吃飯":"吃飯",
-    # 平台費用
-    "蝦皮手續費":"蝦皮手續費","手續費":"手續費","服務費":"服務費",
-    "刷卡":"刷卡費","金流":"金流費","平台抽成":"平台抽成",
     # 損耗退貨
     "退錢":"退款","退款":"退款",
     # 行銷廣告
@@ -668,13 +665,10 @@ COST_STRUCTURE_MAP = {
     "設備維修":"設備維修","設備零件":"設備維修","馬達":"設備維修",
     "風扇":"設備維修","水泵":"設備維修","噴頭":"設備維修","管線":"設備維修",
     "農藥":"農藥肥料","肥料":"農藥肥料",
-    "7-11活動":"活動銷售","福袋活動":"活動銷售",
     "檢疫":"進出口費用","關稅":"進出口費用","罰金":"進出口費用",
     "出口費用":"進出口費用","標籤帶":"進出口費用",
     "機票":"差旅費","住宿":"差旅費","計程車":"差旅費","接機":"差旅費","機加酒":"差旅費",
     "晚餐":"餐飲交際","尾牙":"餐飲交際","吃飯":"餐飲交際",
-    "蝦皮手續費":"平台費用","手續費":"平台費用","服務費":"平台費用",
-    "刷卡費":"平台費用","金流費":"平台費用","平台抽成":"平台費用",
     "退款":"損耗退貨",
     "廣告":"行銷廣告","廣告投放":"行銷廣告","拍攝":"行銷廣告",
     "設計":"行銷廣告","印刷":"行銷廣告","名片":"行銷廣告",
@@ -684,10 +678,8 @@ COST_STRUCTURE_MAP = {
 }
 
 CHANNELS = {
-    "蝦皮":"蝦皮","shopee":"蝦皮",
-    "w上架":"蝦皮/網路","上架":"蝦皮/網路",
-    "711":"7-11福袋","福袋":"7-11福袋",
-    "大陸":"大陸出口","黃浩":"大陸出口","馬薩":"大陸出口",
+    "大陸":"大陸出口","鉑茵植造":"大陸出口",
+    "閩卉園藝":"大陸出口","卉通園藝":"大陸出口",
     "韓國":"韓國出口","植系":"植系",
 }
 
@@ -721,11 +713,17 @@ def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
     if m:
         qty = to_int(m.group(1))
         return qty, to_number(m.group(2))
-    m = re.search(r'(\d[\d,]*)\s*[顆盒個株]', item)
+    m = re.search(r'(\d[\d,]*)\s*[顆棵盒個株]', item)
     if m:
         qty = to_int(m.group(1))
         return qty, (round(amount / qty) if qty > 0 else 0)
     return 0, 0
+
+def number_from_field(value: str):
+    m = re.search(NUMBER_PATTERN, str(value))
+    if not m:
+        return ""
+    return to_number(m.group(0))
 
 def extract_labeled_customer(text: str) -> tuple[str, str]:
     m = re.search(r"\s+(?:客戶|廠商|供應商|對象)\s*[:：]\s*(.+)$", text)
@@ -735,21 +733,11 @@ def extract_labeled_customer(text: str) -> tuple[str, str]:
     text = text[:m.start()].strip()
     return text, customer
 
-def extract_wholesale_price(text: str) -> tuple[str, float | int | str]:
-    pattern = rf"(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*({NUMBER_PATTERN})"
-    m = re.search(pattern, text)
-    if not m:
-        return text, ""
-    wholesale_price = to_number(m.group(1))
-    text = (text[:m.start()] + " " + text[m.end():]).strip()
-    return re.sub(r"\s+", " ", text), wholesale_price
-
 def clean_item_text(text: str) -> str:
     text = re.sub(r'(\d[\d,]*)\s*rmb|rmb\s*(\d[\d,]*)|人民幣\s*(\d[\d,]*)', ' ', text, flags=re.IGNORECASE)
     text = re.sub(rf'(?:total|總額)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(rf'(?:售出批發價|批發售價|批發價|批價)\s*[:：]?\s*{NUMBER_PATTERN}', ' ', text)
     text = re.sub(rf'(?:進價|單價|一袋成本|成本)\s*{NUMBER_PATTERN}', ' ', text)
-    text = re.sub(r'\d[\d,]*\s*[顆盒個株袋]', ' ', text)
+    text = re.sub(r'\d[\d,]*\s*[顆棵盒個株袋]', ' ', text)
     return re.sub(r"\s+", " ", text).strip()
 
 # ══════════════════════════════════════════════════════════════
@@ -764,9 +752,9 @@ LABEL_ALIASES = {
     "狀態": "status", "状态": "status", "付款狀態": "status",
     "日期": "date", "交易日期": "date",
     "期限": "due", "付款期限": "due", "到期日": "due",
-    "進價": "cost", "进价": "cost", "成本": "cost",
-    "批發價": "wholesale_price", "批發售價": "wholesale_price",
-    "售出批發價": "wholesale_price", "批價": "wholesale_price",
+    "數量": "qty", "数量": "qty",
+    "售出單價": "unit_price", "售價": "unit_price",
+    "進貨單價": "cost", "進價": "cost", "进价": "cost", "成本": "cost",
     "人民幣": "rmb", "人民币": "rmb", "rmb": "rmb", "RMB": "rmb",
     "已收": "collected", "已收金額": "collected",
     "備註": "note", "备注": "note",
@@ -850,14 +838,8 @@ def parse_labeled_message(text: str) -> dict | None:
     cost_per_unit = 0
     if "cost" in fields:
         try:
-            cost_per_unit = to_number(fields["cost"])
-        except ValueError:
-            return None
-
-    wholesale_price = ""
-    if "wholesale_price" in fields:
-        try:
-            wholesale_price = to_number(fields["wholesale_price"])
+            cost_value = number_from_field(fields["cost"])
+            cost_per_unit = cost_value if cost_value != "" else 0
         except ValueError:
             return None
 
@@ -873,7 +855,26 @@ def parse_labeled_message(text: str) -> dict | None:
         else:
             rmb = ""
 
-    qty, unit_price = extract_qty_and_unit_price(item, amount)
+    item_qty, item_unit_price = extract_qty_and_unit_price(item, amount)
+    qty = item_qty
+    if "qty" in fields:
+        try:
+            qty_value = number_from_field(fields["qty"])
+        except ValueError:
+            return None
+        if qty_value != "":
+            qty = int(qty_value)
+
+    unit_price = item_unit_price
+    if "unit_price" in fields:
+        try:
+            unit_price_value = number_from_field(fields["unit_price"])
+        except ValueError:
+            return None
+        if unit_price_value != "":
+            unit_price = unit_price_value
+    elif qty and not unit_price:
+        unit_price = round(amount / qty) if qty > 0 else 0
 
     gross_profit = ""
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
@@ -898,7 +899,6 @@ def parse_labeled_message(text: str) -> dict | None:
         "overdue_days":   overdue_days,
         "qty":            qty,
         "unit_price":     unit_price,
-        "wholesale_price": wholesale_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
         "channel":        guess_channel(item, customer, text),
@@ -915,7 +915,25 @@ def parse_labeled_message(text: str) -> dict | None:
 def parse_message(text: str) -> dict | None:
     if is_labeled_format(text):
         return parse_labeled_message(text)
-    return parse_spaced_message(text)
+    return None
+
+BUTTON_TEMPLATE_TEXTS = {"記收入", "記支出", "更新收款"}
+
+def is_blank_labeled_template(text: str) -> bool:
+    if not is_labeled_format(text):
+        return False
+    fields = extract_labeled_fields(text)
+    return not all(fields.get(k, "").strip() for k in ("type", "amount", "item"))
+
+def should_ignore_template_prompt(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.replace("　", " ")).strip()
+    if normalized in BUTTON_TEMPLATE_TEXTS:
+        return True
+    if re.fullmatch(r"更新TX-已收", normalized, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"(刪除|恢復)TX-", normalized, re.IGNORECASE):
+        return True
+    return is_blank_labeled_template(text)
 
 def parse_spaced_message(text: str) -> dict | None:
     text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
@@ -959,7 +977,6 @@ def parse_spaced_message(text: str) -> dict | None:
     if sm:
         remaining = remaining[:sm.start()].strip()
 
-    remaining, wholesale_price = extract_wholesale_price(remaining)
     remaining, customer = extract_labeled_customer(remaining)
 
     cost_per_unit = 0
@@ -979,7 +996,7 @@ def parse_spaced_message(text: str) -> dict | None:
     qty, unit_price = extract_qty_and_unit_price(remaining, amount)
 
     item = clean_item_text(remaining)
-    has_detail_parts = bool(cost_per_unit or wholesale_price or rmb or qty)
+    has_detail_parts = bool(cost_per_unit or rmb or qty)
     if not customer and " " in item and (tx_type == TX_INCOME or has_detail_parts):
         item, customer = [p.strip() for p in item.rsplit(" ", 1)]
     if not item:
@@ -1007,7 +1024,6 @@ def parse_spaced_message(text: str) -> dict | None:
         "overdue_days":   overdue_days,
         "qty":            qty,
         "unit_price":     unit_price,
-        "wholesale_price": wholesale_price,
         "cost_per_unit":  cost_per_unit,
         "gross_profit":   gross_profit,
         "channel":        guess_channel(item, customer, text),
@@ -1386,7 +1402,7 @@ def append_transaction(wb, data: dict) -> tuple[int, str]:
     row = [
         data["date"], data["type"], data["amount"], data["item"],
         data["customer"], data["status"], data["pay_date"],
-        data["qty"], data["unit_price"], data["wholesale_price"], data["cost_per_unit"],
+        data["qty"], data["unit_price"], data["cost_per_unit"],
         data["gross_profit"], data["channel"], data["days_to_collect"],
         data["note"], data["category"], data["cost_structure"],
         data["month"], data["rmb"], data["exchange_rate"], data["raw"], tx_id, "",
@@ -1733,11 +1749,9 @@ def format_new_transaction_reply(data: dict, tx_id: str, recv_added: bool, custo
         f"分類｜{data['category']}",
     ]
     if data["qty"]:
-        lines.append(f"數量｜{data['qty']:,} 顆/盒")
+        lines.append(f"數量｜{data['qty']:,}")
     if data["unit_price"]:
         lines.append(f"售價｜NT$ {data['unit_price']:,} / 顆")
-    if data["wholesale_price"]:
-        lines.append(f"批發售價｜NT$ {data['wholesale_price']:,} / 顆")
     if data["cost_per_unit"]:
         lines.append(f"進價｜NT$ {data['cost_per_unit']:,} / 顆")
     if data["gross_profit"] != "":
@@ -1831,61 +1845,50 @@ def format_restore_reply(result: dict) -> str:
 HELP_TEXT = """溫室帳目機器人
 
 【紀錄收入】
-基本格式：
-收入 金額 品項 客戶 [付款狀態] [期限日期] [進價] [批發價]
-
-可用簡寫：
-+金額 品項 客戶 [付款狀態]
-
-收入範例：
-收入 50000 珍妮500顆 李淵男
-收入 32000 爆米花1000顆 美琪 未付
-收入 50000 珍妮500顆 李淵男 已收
-收入 50000 珍妮500顆 李淵男 未付 期限7/15
-收入 50000 珍妮500顆 李淵男 部分收 30000
-收入 50000 珍妮500顆 李淵男 進價30
-收入 20000 鹿角蕨40顆 姜孟學 批發價450 已收
-+50000 侏儒黃月1000顆 吳政翰
+請使用按鈕模板或標籤格式：
+記收入
+日期：7/1
+類型：收入
+金額：50000
+品項：珍妮
+數量：500棵
+售出單價：100
+進貨單價：30
+客戶：李淵男
+狀態：未付
+期限：7/31
 
 【紀錄支出】
-基本格式：
-支出 金額 品項 [對象/備註] [付款狀態]
-
-可用簡寫：
--金額 品項 [對象/備註]
-
-支出範例：
-支出 18000 大陸運費
-支出 400 測試 姜孟學 已付
-支出 18114 換人民幣4000 黃浩
--4200 淘寶悶箱
-
-【補登以前日期】
-日期可放在最前面：
-2026/05/29 收入 20000 鹿角蕨40顆 姜孟學 未付
-2026-05-29 支出 400 測試 姜孟學 已付
-5/29 收入 20000 鹿角蕨40顆 姜孟學
-5-29 支出 400 測試
-
-【可選欄位說明】
-付款狀態：已收 / 已付 / 未付 / 部分收
-期限日期：期限7/15 或 付款期限2026/07/15
-部分收款：部分收 30000
-進價：進價30
-批發售價：批發價120 / 批發售價120 / 批價120
-外匯：人民幣4000 / RMB4000 / 4000 RMB
-
-【標籤格式】
-也可用一行一欄輸入：
+請使用按鈕模板或標籤格式：
+記支出
 日期：7/1
 類型：支出
 金額：3000
 品項：罰款
+數量：
 廠商：
 狀態：已付
+期限：
 
-可用標籤：日期、類型、金額、品項、客戶、廠商、狀態、期限、進價、批發價、人民幣、已收、備註
+【可選欄位說明】
+付款狀態：已收 / 已付 / 未付 / 部分收
+日期留空：預設今天
+收入期限留空：預設交易日起1個月
+部分收款：已收：30000
+數量：數量：500棵 / 數量：500
+售出單價：售出單價：100
+進貨單價：進貨單價：30
+外匯：人民幣：4000 / RMB：4000
+
+可用標籤：日期、類型、金額、品項、數量、售出單價、進貨單價、客戶、廠商、狀態、期限、人民幣、已收、備註
 標籤格式必填：類型、金額、品項
+舊格式如「收入 50000 品項 客戶」已停用
+
+【按鈕文字】
+記收入 / 記支出 / 更新收款：只作為輸入模板，不會回覆也不會記帳
+整理：執行整理
+刪除 TX-0001：軟刪除
+恢復 TX-0001：恢復軟刪除
 
 【自動規則】
 未輸入日期：預設今天
@@ -1989,6 +1992,9 @@ def handle_message(event):
     reply_token = event.reply_token
     message_id  = getattr(event.message, "id", None)
 
+    if should_ignore_template_prompt(user_text):
+        return
+
     with ApiClient(configuration) as api_client:
         line_api = MessagingApi(api_client)
 
@@ -2090,8 +2096,17 @@ def handle_message(event):
             if parsed is None:
                 reply = (
                     "❌ 無法解析此訊息\n\n"
-                    "新增：收入 50000 珍妮500顆 李淵男\n"
-                    "更新：更新 TX-0001 已收\n\n"
+                    "新增交易請使用標籤格式：\n"
+                    "記收入\n"
+                    "日期：7/1\n"
+                    "類型：收入\n"
+                    "金額：50000\n"
+                    "品項：珍妮\n"
+                    "數量：500棵\n"
+                    "售出單價：100\n"
+                    "進貨單價：30\n"
+                    "客戶：李淵男\n\n"
+                    "更新收款請輸入：更新 TX-0001 已收\n\n"
                     "輸入「說明」查看完整格式"
                 )
             else:
