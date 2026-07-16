@@ -2000,6 +2000,28 @@ def handle_message(event):
     reply_token = event.reply_token
     message_id  = getattr(event.message, "id", None)
 
+    if user_text in ("我的ID", "我的id", "查ID", "查id"):
+        user_id = getattr(event.source, "user_id", "")
+        group_id = getattr(event.source, "group_id", "")
+        room_id = getattr(event.source, "room_id", "")
+        lines = [
+            "你的 LINE User ID：",
+            user_id or "讀取不到 user_id",
+        ]
+        if group_id:
+            lines += ["", "目前群組 ID：", group_id]
+        if room_id:
+            lines += ["", "目前聊天室 ID：", room_id]
+        with ApiClient(configuration) as api_client:
+            line_api = MessagingApi(api_client)
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text="\n".join(lines))],
+                )
+            )
+        return
+
     if should_ignore_template_prompt(user_text):
         return
 
