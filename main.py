@@ -31,6 +31,11 @@ SPREADSHEET_ID            = os.environ["SPREADSHEET_ID"]
 GOOGLE_CREDS_JSON         = os.environ["GOOGLE_CREDENTIALS_JSON"]
 APP_TIMEZONE              = os.environ.get("APP_TIMEZONE", "Asia/Taipei")
 CRON_SECRET               = os.environ.get("CRON_SECRET", "")
+ALLOWED_USER_IDS          = {
+    user_id.strip()
+    for user_id in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    if user_id.strip()
+}
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -598,11 +603,17 @@ def remember_message(mid):
     _recent_message_ids.append(mid)
     _recent_message_id_set.add(mid)
 
+def is_allowed_user(event) -> bool:
+    if not ALLOWED_USER_IDS:
+        return True
+    user_id = getattr(event.source, "user_id", "")
+    return user_id in ALLOWED_USER_IDS
+
 # ══════════════════════════════════════════════════════════════
 # 分類字典
 # ══════════════════════════════════════════════════════════════
 CATEGORIES = {
-    "顆":"種苗銷售","盒":"種苗銷售","株":"種苗銷售","棵":"種苗銷售",
+    "顆":"種苗銷售","棵":"種苗銷售","盒":"種苗銷售","株":"種苗銷售",
     "珍妮":"種苗銷售","侏儒":"種苗銷售","斑葉":"種苗銷售",
     "黃月":"種苗銷售","神鉅":"種苗銷售","妙蛙":"種苗銷售",
     "火鶴":"種苗銷售","鹿角":"種苗銷售","爆米花":"種苗銷售",
@@ -647,6 +658,7 @@ CATEGORIES = {
     "營業稅":"營業稅","所得稅":"所得稅","規費":"規費","牌照":"牌照",
     # 場地活動
     "攤位":"攤位費","市集":"市集活動","展覽":"展覽","報名費":"報名費",
+    "Railway":"訂閱費用",
 }
 
 COST_STRUCTURE_MAP = {
@@ -675,6 +687,7 @@ COST_STRUCTURE_MAP = {
     "轉帳費":"銀行費用","匯費":"銀行費用","銀行手續費":"銀行費用","利息":"銀行費用",
     "營業稅":"稅務規費","所得稅":"稅務規費","規費":"稅務規費","牌照":"稅務規費",
     "攤位費":"活動費用","市集活動":"活動費用","展覽":"活動費用","報名費":"活動費用",
+    "訂閱費用":"人事費用",
 }
 
 CHANNELS = {
@@ -2020,6 +2033,10 @@ def handle_message(event):
                     messages=[TextMessage(text="\n".join(lines))],
                 )
             )
+        return
+
+    if not is_allowed_user(event):
+        logger.warning("Rejected unauthorized LINE user_id=%s", getattr(event.source, "user_id", ""))
         return
 
     if should_ignore_template_prompt(user_text):
