@@ -605,7 +605,8 @@ def remember_message(mid):
 
 def is_allowed_user(event) -> bool:
     if not ALLOWED_USER_IDS:
-        return True
+        logger.error("ALLOWED_USER_IDS is empty; rejecting all accounting commands")
+        return False
     user_id = getattr(event.source, "user_id", "")
     return user_id in ALLOWED_USER_IDS
 
@@ -624,7 +625,8 @@ CATEGORIES = {
     "斑葉橘柄":"種苗銷售","斑葉神巨":"種苗銷售",
     "種苗":"種苗銷售","植物":"種苗銷售",
     # 物流/包材
-    "運費":"一般運費","空軍":"空軍物流","黑貓":"黑貓宅配","郵局":"郵局寄送",
+    "進口運費":"進貨","訂單運費":"一般運費",
+    "空軍":"空軍物流","黑貓":"黑貓宅配","郵局":"郵局寄送",
     "宅配":"宅配","貨運":"貨運","冷藏":"冷藏配送",
     "水苔":"水苔","紙箱":"紙箱","膠膜":"膠膜","膠帶":"膠帶",
     "氣泡布":"氣泡布","保麗龍":"保麗龍","紙板":"紙板","包材":"包材",
