@@ -44,6 +44,7 @@ SHEET_TRANSACTIONS = "📋 交易記錄"
 SHEET_RECEIVABLES  = "💰 應收帳款"
 SHEET_MONTHLY_OVERVIEW = "📊 月份總覽"
 SHEET_CUSTOMER_ANALYSIS = "👥 客戶分析"
+SHEET_INVENTORY = "📦 庫存"
 
 TX_INCOME   = "收入"
 TX_EXPENSE  = "支出"
@@ -98,6 +99,16 @@ CUST_COL_OUTSTANDING = 4
 CUST_COL_COUNT       = 5
 CUST_COL_RECENT      = 6
 
+# 庫存欄位
+INV_COL_SKU           = 1
+INV_COL_STOCK         = 2
+INV_COL_UNIT          = 3
+INV_COL_AVG_COST      = 4
+INV_COL_LAST_PURCHASE = 5
+INV_COL_LAST_SALE     = 6
+INV_COL_SAFETY        = 7
+INV_COL_NOTE          = 8
+
 RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
@@ -105,6 +116,7 @@ MIN_TRANSACTION_ROW = 3
 TX_LAST_COL = COL_DELETED_AT
 RECV_LAST_COL = RECV_COL_DELETED_AT
 MONTHLY_LAST_COL = 19
+INV_LAST_COL = INV_COL_NOTE
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
 ROW_COLOR_DELETED = {"red": 0.82, "green": 0.82, "blue": 0.82}
@@ -634,7 +646,7 @@ CATEGORIES = {
     "土":"介質土","盆":"盆器","木板":"木板",
     "電費":"水電費","水電":"水電費",
     "租金":"租金","薪水":"薪資","薪資":"薪資",
-    "工讀":"工資","臨時工":"工資","獎金":"獎金","加班":"加班",
+    "工讀":"工讀","臨時工":"臨時工","獎金":"獎金","加班":"加班",
     "換人民幣":"人民幣換匯","換rmb":"人民幣換匯","匯款":"匯款","人民幣":"人民幣換匯",
     "燈":"燈具設備","機器":"機器設備","噴霧":"噴霧設備","冰箱":"冰箱設備","ro機":"RO設備",
     "維修":"設備維修","修理":"設備維修","零件":"設備零件",
@@ -663,6 +675,13 @@ CATEGORIES = {
     "Railway":"訂閱費用",
 }
 
+PLANT_SKUS = [
+    "白斑犀牛皮", "斑葉橘柄", "斑葉神巨", "愛心氣球",
+    "紅水晶", "豆豆龍", "戰鬥機", "爆米花",
+    "珍妮", "侏儒", "黃月", "神鉅", "妙蛙", "火鶴",
+    "鹿角", "白怪", "聖靈", "粉斑", "nano", "omg", "delta",
+]
+
 COST_STRUCTURE_MAP = {
     "種苗銷售":"進貨成本","進貨":"進貨成本",
     "一般運費":"物流費用","空軍物流":"物流費用","黑貓宅配":"物流費用",
@@ -672,7 +691,7 @@ COST_STRUCTURE_MAP = {
     "悶箱":"耗材費用","棉花":"耗材費用","垃圾袋":"耗材費用",
     "介質土":"耗材費用","盆器":"耗材費用","木板":"耗材費用",
     "水電費":"水電費","租金":"租金","薪資":"人事費用",
-    "工資":"人事費用","獎金":"人事費用","加班":"人事費用",
+    "工讀":"人事費用","臨時工":"人事費用","獎金":"人事費用","加班":"人事費用",
     "人民幣換匯":"換匯","匯款":"換匯",
     "燈具設備":"設備投資","機器設備":"設備投資","噴霧設備":"設備投資",
     "冰箱設備":"設備投資","RO設備":"設備投資",
@@ -719,6 +738,18 @@ def guess_cost_structure(category: str, tx_type: str) -> str:
     if tx_type != TX_EXPENSE:
         return ""
     return COST_STRUCTURE_MAP.get(category, "其他費用")
+
+def detect_plant_sku(*texts: str) -> str:
+    combined = " ".join(str(t or "") for t in texts).lower()
+    for sku in sorted(PLANT_SKUS, key=len, reverse=True):
+        if sku.lower() in combined:
+            return sku
+    return ""
+
+def detect_inventory_unit(*texts: str) -> str:
+    combined = " ".join(str(t or "") for t in texts)
+    m = re.search(rf"{NUMBER_PATTERN}\s*(顆|棵|盒|個|株)", combined)
+    return m.group(1) if m else "棵"
 
 def extract_qty_and_unit_price(item: str, amount: int) -> tuple:
     m = re.search(rf'\$({NUMBER_PATTERN})\s*[*×x]\s*(\d[\d,]*)', item)
@@ -1564,6 +1595,243 @@ def update_customer_analysis(wb, data: dict | None = None) -> bool:
         return False
     return refresh_customer_analysis(wb)
 
+def inventory_empty_entry() -> dict:
+    return {
+        "stock": 0,
+        "unit": "棵",
+        "purchase_qty": 0,
+        "purchase_cost": 0,
+        "last_purchase": None,
+        "last_sale": None,
+    }
+
+def get_or_create_inventory_sheet(wb):
+    try:
+        sheet = wb.worksheet(SHEET_INVENTORY)
+    except Exception:
+        sheet = wb.add_worksheet(title=SHEET_INVENTORY, rows=100, cols=INV_LAST_COL)
+
+    sheet.update(
+        range_a1(1, 1, 2, INV_LAST_COL),
+        [[
+            "📦 植物庫存",
+            "", "", "", "", "", "", "",
+        ], [
+            "品種", "目前庫存", "單位", "平均進價",
+            "最近進貨日", "最近售出日", "安全水位", "備註",
+        ]],
+        value_input_option="RAW",
+    )
+    return sheet
+
+def read_inventory_meta(sheet) -> tuple[list[str], dict]:
+    values = sheet.get_all_values()
+    existing_names = []
+    meta = {}
+    for row in values[MIN_TRANSACTION_ROW - 1:]:
+        sku = row[INV_COL_SKU - 1].strip() if len(row) >= INV_COL_SKU and row[INV_COL_SKU - 1] else ""
+        if not sku:
+            continue
+        if sku not in existing_names:
+            existing_names.append(sku)
+        meta[sku] = {
+            "safety": row[INV_COL_SAFETY - 1] if len(row) >= INV_COL_SAFETY else "",
+            "note": row[INV_COL_NOTE - 1] if len(row) >= INV_COL_NOTE else "",
+        }
+    return existing_names, meta
+
+def inventory_stats_from_transactions(wb) -> dict:
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    tx_values = tx_sheet.get_all_values()
+    stats = {}
+
+    for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
+        if is_soft_deleted_row(row, COL_DELETED_AT):
+            continue
+
+        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
+        if tx_type not in (TX_INCOME, TX_EXPENSE):
+            continue
+
+        item = row[COL_ITEM - 1] if len(row) >= COL_ITEM else ""
+        raw = row[COL_RAW - 1] if len(row) >= COL_RAW else ""
+        category = row[COL_CATEGORY - 1] if len(row) >= COL_CATEGORY else ""
+        if not category:
+            category = guess_category(f"{item} {raw}")
+        if category != "種苗銷售":
+            continue
+
+        sku = detect_plant_sku(item, raw)
+        if not sku:
+            continue
+
+        qty_text = row[COL_QTY - 1] if len(row) >= COL_QTY else ""
+        try:
+            qty = to_number(qty_text) if qty_text else 0
+        except ValueError:
+            qty = 0
+        if qty <= 0:
+            continue
+
+        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+        tx_date = parse_date_value(str(date_text)) if date_text else None
+        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else ""
+        cost_text = row[COL_COST - 1] if len(row) >= COL_COST else ""
+        try:
+            amount = to_number(amount_text) if amount_text else 0
+        except ValueError:
+            amount = 0
+        try:
+            cost_per_unit = to_number(cost_text) if cost_text else 0
+        except ValueError:
+            cost_per_unit = 0
+
+        entry = stats.setdefault(sku, inventory_empty_entry())
+        entry["unit"] = detect_inventory_unit(item, raw) or entry["unit"]
+        if tx_type == TX_EXPENSE:
+            entry["stock"] += qty
+            entry["purchase_qty"] += qty
+            unit_cost = cost_per_unit if cost_per_unit else (amount / qty if qty else 0)
+            entry["purchase_cost"] += unit_cost * qty
+            if tx_date and (entry["last_purchase"] is None or tx_date > entry["last_purchase"]):
+                entry["last_purchase"] = tx_date
+        elif tx_type == TX_INCOME:
+            entry["stock"] -= qty
+            if tx_date and (entry["last_sale"] is None or tx_date > entry["last_sale"]):
+                entry["last_sale"] = tx_date
+
+    return stats
+
+def inventory_record_from_entry(sku: str, entry: dict, meta: dict) -> dict:
+    avg_cost = ""
+    if entry["purchase_qty"]:
+        avg_cost = rounded_amount(entry["purchase_cost"] / entry["purchase_qty"])
+    return {
+        "sku": sku,
+        "stock": rounded_amount(entry["stock"]),
+        "unit": entry["unit"] or "棵",
+        "avg_cost": avg_cost,
+        "last_purchase": entry["last_purchase"].strftime("%Y/%m/%d") if entry["last_purchase"] else "",
+        "last_sale": entry["last_sale"].strftime("%Y/%m/%d") if entry["last_sale"] else "",
+        "safety": meta.get("safety", ""),
+        "note": meta.get("note", ""),
+    }
+
+def refresh_inventory(wb) -> dict:
+    sheet = get_or_create_inventory_sheet(wb)
+    existing_names, existing_meta = read_inventory_meta(sheet)
+    stats = inventory_stats_from_transactions(wb)
+
+    all_skus = []
+    for sku in existing_names + PLANT_SKUS + sorted(stats):
+        if sku and sku not in all_skus:
+            all_skus.append(sku)
+
+    old_values = sheet.get_all_values()
+    old_row_count = max(len(old_values), MIN_TRANSACTION_ROW - 1)
+    if old_row_count >= MIN_TRANSACTION_ROW:
+        sheet.batch_clear([range_a1(MIN_TRANSACTION_ROW, 1, old_row_count, INV_LAST_COL)])
+
+    rows = []
+    records = []
+    for sku in all_skus:
+        entry = stats.get(sku, inventory_empty_entry())
+        record = inventory_record_from_entry(sku, entry, existing_meta.get(sku, {}))
+        records.append(record)
+        rows.append([
+            record["sku"], record["stock"], record["unit"], record["avg_cost"],
+            record["last_purchase"], record["last_sale"], record["safety"], record["note"],
+        ])
+
+    if rows:
+        sheet.update(
+            range_a1(MIN_TRANSACTION_ROW, 1, MIN_TRANSACTION_ROW + len(rows) - 1, INV_LAST_COL),
+            rows,
+            value_input_option="RAW",
+        )
+        apply_alternating_row_colors_to(sheet, INV_LAST_COL, MIN_TRANSACTION_ROW + len(rows) - 1)
+
+    return {
+        "ok": True,
+        "updated": len(rows),
+        "records": records,
+    }
+
+def parse_inventory_command(text: str) -> str | None:
+    text = text.strip()
+    if text == "庫存":
+        return ""
+    if text.startswith("庫存 "):
+        return text.replace("　", " ")[len("庫存 "):].strip()
+    if text.startswith("庫存"):
+        return text[len("庫存"):].strip()
+    return None
+
+def inventory_number(value) -> str:
+    if value in ("", None):
+        return "-"
+    value = rounded_amount(value)
+    return f"{value:,}" if isinstance(value, (int, float)) else str(value)
+
+def safety_warning(record: dict) -> str:
+    safety = record.get("safety", "")
+    if safety in ("", None):
+        return ""
+    try:
+        safety_value = to_number(safety)
+        stock_value = to_number(record.get("stock", 0))
+    except ValueError:
+        return ""
+    if stock_value < safety_value:
+        return f"⚠️ 低於安全水位 {inventory_number(safety_value)}"
+    return ""
+
+def find_inventory_record(records: list[dict], query: str) -> dict | None:
+    query = query.strip()
+    if not query:
+        return None
+    sku = detect_plant_sku(query)
+    candidates = [sku] if sku else [query]
+    for candidate in candidates:
+        for record in records:
+            if record["sku"].lower() == candidate.lower():
+                return record
+    for record in records:
+        if query.lower() in record["sku"].lower():
+            return record
+    return None
+
+def format_inventory_reply(records: list[dict], query: str = "") -> str:
+    if query:
+        record = find_inventory_record(records, query)
+        if not record:
+            return f"❌ 找不到「{query}」的庫存資料，請確認品種名稱。"
+        lines = [
+            f"📦 庫存｜{record['sku']}",
+            "─" * 22,
+            f"目前庫存｜{inventory_number(record['stock'])} {record['unit']}",
+            f"平均進價｜NT$ {inventory_number(record['avg_cost'])}",
+            f"最近進貨｜{record['last_purchase'] or '-'}",
+            f"最近售出｜{record['last_sale'] or '-'}",
+            f"安全水位｜{record['safety'] or '-'}",
+        ]
+        warning = safety_warning(record)
+        if warning:
+            lines.append(warning)
+        if record["note"]:
+            lines.append(f"備註｜{record['note']}")
+        return "\n".join(lines)
+
+    lines = ["📦 庫存總覽", "─" * 22]
+    for record in records:
+        stock = inventory_number(record["stock"])
+        avg_cost = inventory_number(record["avg_cost"])
+        warning = " ⚠️" if safety_warning(record) else ""
+        lines.append(f"{record['sku']}｜{stock}{record['unit']}｜均價 {avg_cost}{warning}")
+    lines.append("─" * 22)
+    lines.append("查單一品種：庫存 珍妮")
+    return "\n".join(lines)
+
 def monthly_summary_empty_stats() -> dict:
     return {
         "income": 0,
@@ -1906,6 +2174,8 @@ HELP_TEXT = """溫室帳目機器人
 【按鈕文字】
 記收入 / 記支出 / 更新收款：只作為輸入模板，不會回覆也不會記帳
 整理：執行整理
+庫存：查詢全部品種庫存
+庫存 珍妮：查詢單一品種庫存
 刪除 TX-0001：軟刪除
 恢復 TX-0001：恢復軟刪除
 
@@ -1916,8 +2186,18 @@ HELP_TEXT = """溫室帳目機器人
 已收/已付：付款日期預設為交易日期
 未付/部分收收入：自動同步應收帳款
 客戶分析與月份總覽：輸入「整理」或每日排程時更新
+植物庫存：輸入「整理」、每日排程或查詢「庫存」時更新
 每筆交易會自動產生固定交易編號，例如 TX-0001
 更新與刪除請用交易編號，排序後也不會更新錯筆
+
+【庫存查詢】
+庫存
+庫存 品種
+
+庫存範例：
+庫存
+庫存 珍妮
+庫存 斑葉神巨
 
 【更新付款狀態】
 更新 交易編號 已收
@@ -1962,12 +2242,14 @@ def refresh_receivables_job() -> dict:
     refresh_receivable_totals(sheet)
     refresh_customer_analysis(wb)
     refresh_monthly_overview(wb)
+    inventory_result = refresh_inventory(wb)
     return {
         "ok": True,
         "date": today_tw().strftime("%Y/%m/%d"),
         "ids_added": ids_added,
         "purged_transactions": purged_transactions,
         "purged_receivables": purged_receivables,
+        "inventory_updated": inventory_result.get("updated", 0),
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -2004,6 +2286,7 @@ def refresh_receivables_route():
             "ids_added": result.get("ids_added", 0),
             "purged_transactions": result.get("purged_transactions", 0),
             "purged_receivables": result.get("purged_receivables", 0),
+            "inventory_updated": result.get("inventory_updated", 0),
         }
     except Exception:
         logger.exception("Scheduled receivables refresh failed")
@@ -2056,15 +2339,30 @@ def handle_message(event):
             try:
                 result = refresh_receivables_job()
                 reply = (
-                    "✅ 交易格式、帳款、月份總覽與客戶分析已整理\n"
+                    "✅ 交易格式、帳款、庫存、月份總覽與客戶分析已整理\n"
                     f"日期｜{result['date']}\n"
                     f"補上交易編號｜{result.get('ids_added', 0)} 筆\n"
                     f"移除逾期刪除交易｜{result.get('purged_transactions', 0)} 筆\n"
-                    f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆"
+                    f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆\n"
+                    f"更新庫存品種｜{result.get('inventory_updated', 0)} 筆"
                 )
             except Exception:
                 logger.exception("Manual receivables refresh failed")
                 reply = "⚠️ 整理失敗，請稍後再試。"
+
+        # ── 庫存查詢 ───────────────────────────────────────────
+        elif user_text.startswith("庫存"):
+            query = parse_inventory_command(user_text)
+            if query is None:
+                reply = "❌ 庫存格式錯誤\n\n正確格式：\n庫存\n庫存 珍妮"
+            else:
+                try:
+                    wb = get_workbook()
+                    result = refresh_inventory(wb)
+                    reply = format_inventory_reply(result["records"], query)
+                except Exception:
+                    logger.exception("Inventory query failed")
+                    reply = "⚠️ 庫存查詢失敗，請稍後再試。"
 
         # ── 更新付款狀態 ────────────────────────────────────────
         elif user_text.startswith("更新"):
