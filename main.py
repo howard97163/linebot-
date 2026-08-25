@@ -103,12 +103,12 @@ CUST_COL_RECENT      = 6
 # 庫存欄位
 INV_COL_SKU           = 1
 INV_COL_STOCK         = 2
-INV_COL_UNIT          = 3
-INV_COL_AVG_COST      = 4
-INV_COL_LAST_PURCHASE = 5
-INV_COL_LAST_SALE     = 6
-INV_COL_SAFETY        = 7
-INV_COL_NOTE          = 8
+INV_COL_AVG_COST      = 3
+INV_COL_VALUE         = 4
+INV_COL_SAFETY        = 5
+INV_COL_DAYS          = 6
+INV_COL_LAST_PURCHASE = 7
+INV_COL_LAST_SALE     = 8
 
 # 庫存異動欄位
 MOV_COL_ID             = 1
@@ -139,7 +139,7 @@ MIN_TRANSACTION_ROW = 3
 TX_LAST_COL = COL_DELETED_AT
 RECV_LAST_COL = RECV_COL_DELETED_AT
 MONTHLY_LAST_COL = 19
-INV_LAST_COL = INV_COL_NOTE
+INV_LAST_COL = INV_COL_LAST_SALE
 MOV_LAST_COL = MOV_COL_NOTE
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
@@ -1010,6 +1010,8 @@ INVENTORY_MOVEMENT_LABEL_ALIASES = {
     "品項": "item", "品种": "item", "品種": "item", "商品": "item",
     "數量": "qty", "数量": "qty",
     "原因": "reason",
+    "關聯交易編號": "related_tx_id", "关联交易编号": "related_tx_id",
+    "交易編號": "related_tx_id", "交易编号": "related_tx_id", "TX-ID": "related_tx_id",
     "備註": "note", "备注": "note",
 }
 _INVENTORY_MOVEMENT_LABEL_RE = re.compile(
@@ -1065,12 +1067,18 @@ def parse_inventory_movement_command(text: str) -> dict | None:
     note = f"原因：{reason}"
     if fields.get("note"):
         note += f"；{fields['note'].strip()}"
+    related_tx_id = ""
+    if fields.get("related_tx_id"):
+        related_tx_id = normalize_tx_id(fields["related_tx_id"])
+        if not related_tx_id:
+            return None
     return {
         "date": movement_date.strftime("%Y/%m/%d"),
         "sku": sku,
         "movement_type": movement_type,
         "qty_change": direction * qty,
         "reason": reason,
+        "related_tx_id": related_tx_id,
         "note": note,
     }
 
@@ -1729,15 +1737,22 @@ def get_or_create_inventory_movement_sheet(wb):
     )
     return sheet
 
-def inventory_movement_exists_for_tx(sheet, tx_id: str) -> bool:
+def inventory_movement_exists_for_tx(sheet, tx_id: str, movement_type: str = "") -> bool:
     normalized = normalize_tx_id(tx_id)
     if not normalized:
         return False
     try:
-        tx_ids = sheet.col_values(MOV_COL_TX_ID)
+        values = sheet.get_all_values()
     except Exception:
         return False
-    return any(normalize_tx_id(value) == normalized for value in tx_ids if value)
+    for row in values[MIN_TRANSACTION_ROW - 1:]:
+        row_tx_id = row[MOV_COL_TX_ID - 1] if len(row) >= MOV_COL_TX_ID else ""
+        row_type = row[MOV_COL_TYPE - 1] if len(row) >= MOV_COL_TYPE else ""
+        if normalize_tx_id(row_tx_id) != normalized:
+            continue
+        if not movement_type or row_type == movement_type:
+            return True
+    return False
 
 def append_inventory_movement_row(
     sheet,
@@ -1764,36 +1779,145 @@ def append_inventory_movement_row(
     apply_alternating_row_colors_to(sheet, MOV_LAST_COL, row_num)
     return movement_id
 
-def inventory_manual_adjustments_from_movements(wb) -> dict:
-    """只彙總沒有關聯 TX-ID 的手動異動，避免自動交易異動被重複計算。"""
-    try:
-        sheet = worksheet_by_names(
-            wb,
-            SHEET_INVENTORY_MOVEMENTS,
-            "庫存異動",
-            "📦 庫存異動",
-        )
-        values = sheet.get_all_values()
-    except Exception:
-        return {}
-
-    adjustments = {}
+def inventory_transaction_records(wb) -> dict:
+    """建立 TX-ID 對應的植物交易資料，供異動同步、成本與軟刪除判斷使用。"""
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    values = tx_sheet.get_all_values()
+    records = {}
     for row in values[MIN_TRANSACTION_ROW - 1:]:
-        related_tx = row[MOV_COL_TX_ID - 1].strip() if len(row) >= MOV_COL_TX_ID and row[MOV_COL_TX_ID - 1] else ""
-        if related_tx:
+        tx_id_text = row[COL_TX_ID - 1] if len(row) >= COL_TX_ID else ""
+        tx_id = normalize_tx_id(tx_id_text)
+        if not tx_id:
             continue
-        sku_text = row[MOV_COL_SKU - 1] if len(row) >= MOV_COL_SKU else ""
-        sku = detect_plant_sku(sku_text)
+
+        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
+        if tx_type not in (TX_INCOME, TX_EXPENSE):
+            continue
+        item = row[COL_ITEM - 1] if len(row) >= COL_ITEM else ""
+        raw = row[COL_RAW - 1] if len(row) >= COL_RAW else ""
+        sku = detect_plant_sku(item, raw)
         if not sku:
             continue
-        qty_text = row[MOV_COL_QTY_CHANGE - 1] if len(row) >= MOV_COL_QTY_CHANGE else ""
+
+        category = row[COL_CATEGORY - 1] if len(row) >= COL_CATEGORY else ""
+        cost_structure = row[COL_COST_STRUCT - 1] if len(row) >= COL_COST_STRUCT else ""
+        if not category:
+            category = guess_category(f"{item} {raw}")
+        if tx_type == TX_INCOME and category == "種苗銷售":
+            movement_type = MOVEMENT_SALE
+            direction = -1
+        elif tx_type == TX_EXPENSE and (category == "種苗銷售" or cost_structure == "進貨成本"):
+            movement_type = MOVEMENT_PURCHASE
+            direction = 1
+        else:
+            continue
+
+        qty_text = row[COL_QTY - 1] if len(row) >= COL_QTY else ""
         try:
-            qty_change = to_number(qty_text) if qty_text else 0
+            qty = to_number(qty_text) if qty_text else 0
         except ValueError:
-            qty_change = 0
-        if qty_change:
-            adjustments[sku] = adjustments.get(sku, 0) + qty_change
-    return adjustments
+            qty = 0
+        if qty <= 0:
+            continue
+
+        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else ""
+        cost_text = row[COL_COST - 1] if len(row) >= COL_COST else ""
+        try:
+            amount = to_number(amount_text) if amount_text else 0
+        except ValueError:
+            amount = 0
+        try:
+            cost_per_unit = to_number(cost_text) if cost_text else 0
+        except ValueError:
+            cost_per_unit = 0
+        if tx_type == TX_EXPENSE and not cost_per_unit and qty:
+            cost_per_unit = amount / qty
+
+        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+        tx_date = parse_date_value(str(date_text)) if date_text else None
+        note = row[COL_NOTE - 1] if len(row) >= COL_NOTE else ""
+        records[tx_id] = {
+            "tx_id": tx_id,
+            "active": not is_soft_deleted_row(row, COL_DELETED_AT),
+            "date": tx_date,
+            "date_text": tx_date.strftime("%Y/%m/%d") if tx_date else str(date_text),
+            "sku": sku,
+            "movement_type": movement_type,
+            "qty_change": direction * qty,
+            "unit_cost": cost_per_unit if tx_type == TX_EXPENSE else 0,
+            "unit": detect_inventory_unit(item, raw),
+            "note": note,
+        }
+    return records
+
+def sort_inventory_movement_sheet(sheet):
+    end_row = len(sheet.col_values(MOV_COL_ID))
+    if end_row <= MIN_TRANSACTION_ROW:
+        return
+    sheet.spreadsheet.batch_update({
+        "requests": [{
+            "sortRange": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": MIN_TRANSACTION_ROW - 1,
+                    "endRowIndex": end_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": MOV_LAST_COL,
+                },
+                "sortSpecs": [
+                    {"dimensionIndex": MOV_COL_DATE - 1, "sortOrder": "ASCENDING"},
+                    {"dimensionIndex": MOV_COL_ID - 1, "sortOrder": "ASCENDING"},
+                ],
+            }
+        }]
+    })
+
+def sync_transaction_inventory_movements(wb, exclude_tx_id: str = "") -> int:
+    """補齊有效植物交易的自動異動；既有 INV-ID 不變，也不重複建立。"""
+    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    ensure_transaction_ids(tx_sheet)
+    records = inventory_transaction_records(wb)
+    sheet = get_or_create_inventory_movement_sheet(wb)
+    exclude_tx_id = normalize_tx_id(exclude_tx_id) if exclude_tx_id else ""
+
+    existing = set()
+    for row in sheet.get_all_values()[MIN_TRANSACTION_ROW - 1:]:
+        row_tx_id = normalize_tx_id(row[MOV_COL_TX_ID - 1]) if len(row) >= MOV_COL_TX_ID else None
+        row_type = row[MOV_COL_TYPE - 1] if len(row) >= MOV_COL_TYPE else ""
+        if row_tx_id and row_type in (MOVEMENT_PURCHASE, MOVEMENT_SALE):
+            existing.add((row_tx_id, row_type))
+
+    next_n = movement_id_number(next_movement_id(sheet))
+    rows = []
+    for tx_id, record in sorted(
+        records.items(),
+        key=lambda item: (item[1]["date"] or today_tw(), tx_id_number(item[0])),
+    ):
+        if not record["active"] or tx_id == exclude_tx_id:
+            continue
+        key = (tx_id, record["movement_type"])
+        if key in existing:
+            continue
+        note = "由歷史記帳交易自動補登"
+        if record["note"]:
+            note += f"；{record['note']}"
+        rows.append([
+            format_movement_id(next_n),
+            record["date_text"],
+            record["sku"],
+            record["movement_type"],
+            rounded_amount(record["qty_change"]),
+            0,
+            tx_id,
+            note,
+        ])
+        next_n += 1
+        existing.add(key)
+
+    if rows:
+        sheet.append_rows(rows, value_input_option="RAW")
+        sort_inventory_movement_sheet(sheet)
+    return len(rows)
 
 def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
     qty = data.get("qty", 0)
@@ -1820,12 +1944,15 @@ def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
     else:
         return {"added": False, "reason": "not_inventory_transaction"}
 
+    # 先補齊過去尚未建立的交易異動，但排除本次交易，讓本次回覆能取得新 INV-ID。
+    sync_transaction_inventory_movements(wb, exclude_tx_id=tx_id)
     sheet = get_or_create_inventory_movement_sheet(wb)
-    if inventory_movement_exists_for_tx(sheet, tx_id):
+    if inventory_movement_exists_for_tx(sheet, tx_id, movement_type):
         return {"added": False, "reason": "already_exists"}
 
-    stats = inventory_stats_from_transactions(wb)
-    balance = stats.get(sku, inventory_empty_entry())["stock"]
+    stats = inventory_stats_from_movements(wb)
+    before = stats.get(sku, inventory_empty_entry())["stock"]
+    balance = before + qty_change
     note = "由記帳交易自動建立"
     if data.get("note"):
         note += f"；{data['note']}"
@@ -1839,6 +1966,9 @@ def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
         tx_id,
         note,
     )
+    sort_inventory_movement_sheet(sheet)
+    refreshed_stats = inventory_stats_from_movements(wb, update_balances=True)
+    balance = refreshed_stats.get(sku, inventory_empty_entry())["stock"]
     return {
         "added": True,
         "movement_id": movement_id,
@@ -1851,7 +1981,18 @@ def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
 def apply_manual_inventory_movement(wb, command: dict) -> dict:
     sku = command["sku"]
     qty_change = command["qty_change"]
-    before_stats = inventory_stats_from_transactions(wb)
+    related_tx_id = command.get("related_tx_id", "")
+    if related_tx_id:
+        tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+        tx_row_num = find_row_by_tx_id(tx_sheet, related_tx_id)
+        if not tx_row_num:
+            return {"ok": False, "error": f"找不到關聯交易編號 {related_tx_id}"}
+        tx_row = tx_sheet.row_values(tx_row_num)
+        if is_soft_deleted_row(tx_row, COL_DELETED_AT):
+            return {"ok": False, "error": f"關聯交易 {related_tx_id} 已標記刪除"}
+
+    sync_transaction_inventory_movements(wb)
+    before_stats = inventory_stats_from_movements(wb)
     before = before_stats.get(sku, inventory_empty_entry())["stock"]
     after = before + qty_change
 
@@ -1863,7 +2004,7 @@ def apply_manual_inventory_movement(wb, command: dict) -> dict:
         command["movement_type"],
         qty_change,
         after,
-        "",
+        related_tx_id,
         command["note"],
     )
     refresh_result = refresh_inventory(wb)
@@ -1878,19 +2019,19 @@ def apply_manual_inventory_movement(wb, command: dict) -> dict:
         "qty_change": rounded_amount(qty_change),
         "before": rounded_amount(before),
         "after": rounded_amount(after),
-        "unit": record["unit"] if record else "棵",
         "avg_cost": record["avg_cost"] if record else "",
+        "related_tx_id": related_tx_id,
         "negative_stock": after < 0,
     }
 
 def inventory_empty_entry() -> dict:
     return {
         "stock": 0,
-        "unit": "棵",
         "purchase_qty": 0,
         "purchase_cost": 0,
         "last_purchase": None,
         "last_sale": None,
+        "sales_30d": 0,
     }
 
 def get_or_create_inventory_sheet(wb):
@@ -1905,8 +2046,8 @@ def get_or_create_inventory_sheet(wb):
             "📦 植物庫存",
             "", "", "", "", "", "", "",
         ], [
-            "品種", "目前庫存", "單位", "平均進價",
-            "最近進貨日", "最近售出日", "安全水位", "備註",
+            "品種", "目前庫存", "平均進價", "庫存價值",
+            "安全水位", "庫存天數", "最近進貨日", "最近售出日",
         ]],
         value_input_option="RAW",
     )
@@ -1922,103 +2063,140 @@ def read_inventory_meta(sheet) -> tuple[list[str], dict]:
             continue
         if sku not in existing_names:
             existing_names.append(sku)
+        # 首次部署時畫面可能只有標題換新，但資料仍是舊欄位順序：
+        # 品種、庫存、單位、均價、最近進貨、最近售出、安全水位、備註。
+        legacy_unit = row[2].strip() if len(row) >= 3 and row[2] else ""
+        is_legacy_layout = legacy_unit in {"顆", "棵", "盒", "個", "株"}
+        safety_col = 7 if is_legacy_layout else INV_COL_SAFETY
         meta[sku] = {
-            "safety": row[INV_COL_SAFETY - 1] if len(row) >= INV_COL_SAFETY else "",
-            "note": row[INV_COL_NOTE - 1] if len(row) >= INV_COL_NOTE else "",
+            "safety": row[safety_col - 1] if len(row) >= safety_col else "",
         }
     return existing_names, meta
 
-def inventory_stats_from_transactions(wb) -> dict:
-    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    tx_values = tx_sheet.get_all_values()
+def inventory_stats_from_movements(wb, update_balances: bool = False) -> dict:
+    """以庫存異動為唯一數量來源；交易資料僅提供成本及軟刪除狀態。"""
+    movement_sheet = get_or_create_inventory_movement_sheet(wb)
+    movement_values = movement_sheet.get_all_values()
+    tx_records = inventory_transaction_records(wb)
     stats = {}
+    seen_automatic_tx = set()
+    balance_updates = []
+    inactive_rows = []
+    cutoff_30d = today_tw() - timedelta(days=29)
 
-    for row in tx_values[MIN_TRANSACTION_ROW - 1:]:
-        if is_soft_deleted_row(row, COL_DELETED_AT):
-            continue
-
-        tx_type = row[COL_TYPE - 1] if len(row) >= COL_TYPE else ""
-        if tx_type not in (TX_INCOME, TX_EXPENSE):
-            continue
-
-        item = row[COL_ITEM - 1] if len(row) >= COL_ITEM else ""
-        raw = row[COL_RAW - 1] if len(row) >= COL_RAW else ""
-        category = row[COL_CATEGORY - 1] if len(row) >= COL_CATEGORY else ""
-        cost_structure = row[COL_COST_STRUCT - 1] if len(row) >= COL_COST_STRUCT else ""
-        if not category:
-            category = guess_category(f"{item} {raw}")
-        is_inventory_tx = (
-            category == "種苗銷售"
-            or (tx_type == TX_EXPENSE and cost_structure == "進貨成本")
-        )
-        if not is_inventory_tx:
-            continue
-
-        sku = detect_plant_sku(item, raw)
+    for row_num, row in enumerate(movement_values[MIN_TRANSACTION_ROW - 1:], start=MIN_TRANSACTION_ROW):
+        sku_text = row[MOV_COL_SKU - 1] if len(row) >= MOV_COL_SKU else ""
+        sku = detect_plant_sku(sku_text)
         if not sku:
             continue
+        movement_type = row[MOV_COL_TYPE - 1] if len(row) >= MOV_COL_TYPE else ""
+        qty_text = row[MOV_COL_QTY_CHANGE - 1] if len(row) >= MOV_COL_QTY_CHANGE else ""
+        try:
+            qty_change = to_number(qty_text) if qty_text else 0
+        except ValueError:
+            qty_change = 0
+        movement_date_text = row[MOV_COL_DATE - 1] if len(row) >= MOV_COL_DATE else ""
+        movement_date = parse_date_value(str(movement_date_text)) if movement_date_text else None
+        related_tx_text = row[MOV_COL_TX_ID - 1] if len(row) >= MOV_COL_TX_ID else ""
+        related_tx_id = normalize_tx_id(related_tx_text) if related_tx_text else ""
 
-        qty_text = row[COL_QTY - 1] if len(row) >= COL_QTY else ""
-        try:
-            qty = to_number(qty_text) if qty_text else 0
-        except ValueError:
-            qty = 0
-        if qty <= 0:
-            continue
-
-        date_text = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
-        tx_date = parse_date_value(str(date_text)) if date_text else None
-        amount_text = row[COL_AMOUNT - 1] if len(row) >= COL_AMOUNT else ""
-        cost_text = row[COL_COST - 1] if len(row) >= COL_COST else ""
-        try:
-            amount = to_number(amount_text) if amount_text else 0
-        except ValueError:
-            amount = 0
-        try:
-            cost_per_unit = to_number(cost_text) if cost_text else 0
-        except ValueError:
-            cost_per_unit = 0
+        counted = True
+        tx_record = None
+        if movement_type in (MOVEMENT_PURCHASE, MOVEMENT_SALE) and related_tx_id:
+            tx_record = tx_records.get(related_tx_id)
+            key = (related_tx_id, movement_type)
+            counted = bool(
+                tx_record
+                and tx_record["active"]
+                and tx_record["movement_type"] == movement_type
+                and tx_record["sku"] == sku
+                and key not in seen_automatic_tx
+            )
+            if counted:
+                seen_automatic_tx.add(key)
+            else:
+                inactive_rows.append(row_num)
 
         entry = stats.setdefault(sku, inventory_empty_entry())
-        entry["unit"] = detect_inventory_unit(item, raw) or entry["unit"]
-        if tx_type == TX_EXPENSE:
-            entry["stock"] += qty
-            entry["purchase_qty"] += qty
-            unit_cost = cost_per_unit if cost_per_unit else (amount / qty if qty else 0)
-            entry["purchase_cost"] += unit_cost * qty
-            if tx_date and (entry["last_purchase"] is None or tx_date > entry["last_purchase"]):
-                entry["last_purchase"] = tx_date
-        elif tx_type == TX_INCOME:
-            entry["stock"] -= qty
-            if tx_date and (entry["last_sale"] is None or tx_date > entry["last_sale"]):
-                entry["last_sale"] = tx_date
+        if counted and qty_change:
+            entry["stock"] += qty_change
+            if movement_type == MOVEMENT_PURCHASE:
+                if movement_date and (entry["last_purchase"] is None or movement_date > entry["last_purchase"]):
+                    entry["last_purchase"] = movement_date
+                unit_cost = tx_record.get("unit_cost", 0) if tx_record else 0
+                if qty_change > 0 and unit_cost > 0:
+                    entry["purchase_qty"] += qty_change
+                    entry["purchase_cost"] += unit_cost * qty_change
+            elif movement_type == MOVEMENT_SALE:
+                sold_qty = abs(qty_change)
+                if movement_date and (entry["last_sale"] is None or movement_date > entry["last_sale"]):
+                    entry["last_sale"] = movement_date
+                if movement_date and cutoff_30d <= movement_date <= today_tw():
+                    entry["sales_30d"] += sold_qty
 
-    # 自動交易異動已有 TX-ID，只作為稽核紀錄；此處只加總手動異動，避免重複計算。
-    for sku, qty_change in inventory_manual_adjustments_from_movements(wb).items():
-        entry = stats.setdefault(sku, inventory_empty_entry())
-        entry["stock"] += qty_change
+        if update_balances:
+            balance_updates.append({
+                "range": cell_a1(row_num, MOV_COL_BALANCE),
+                "values": [[rounded_amount(entry["stock"])]]
+            })
+
+    if update_balances:
+        if balance_updates:
+            movement_sheet.batch_update(balance_updates)
+        end_row = len(movement_sheet.col_values(MOV_COL_ID))
+        if end_row >= MIN_TRANSACTION_ROW:
+            apply_alternating_row_colors_to(movement_sheet, MOV_LAST_COL, end_row)
+        if inactive_rows:
+            requests = []
+            for row_num in inactive_rows:
+                append_row_format_request(movement_sheet, row_num, MOV_LAST_COL, ROW_COLOR_DELETED, requests)
+            movement_sheet.spreadsheet.batch_update({"requests": requests})
 
     return stats
 
 def inventory_record_from_entry(sku: str, entry: dict, meta: dict) -> dict:
     avg_cost = ""
+    raw_avg_cost = 0
     if entry["purchase_qty"]:
-        avg_cost = rounded_amount(entry["purchase_cost"] / entry["purchase_qty"])
+        raw_avg_cost = entry["purchase_cost"] / entry["purchase_qty"]
+        avg_cost = rounded_amount(raw_avg_cost)
+    inventory_value = rounded_amount(entry["stock"] * raw_avg_cost) if avg_cost != "" else ""
+    daily_sales = entry["sales_30d"] / 30 if entry["sales_30d"] else 0
+    inventory_days = ""
+    if daily_sales > 0:
+        inventory_days = rounded_amount(max(entry["stock"], 0) / daily_sales)
     return {
         "sku": sku,
         "stock": rounded_amount(entry["stock"]),
-        "unit": entry["unit"] or "棵",
         "avg_cost": avg_cost,
+        "inventory_value": inventory_value,
+        "inventory_days": inventory_days,
         "last_purchase": entry["last_purchase"].strftime("%Y/%m/%d") if entry["last_purchase"] else "",
         "last_sale": entry["last_sale"].strftime("%Y/%m/%d") if entry["last_sale"] else "",
         "safety": meta.get("safety", ""),
-        "note": meta.get("note", ""),
     }
 
+def apply_inventory_safety_formats(sheet, records: list[dict]):
+    requests = []
+    for index, record in enumerate(records, start=MIN_TRANSACTION_ROW):
+        safety = record.get("safety", "")
+        if safety in ("", None):
+            continue
+        try:
+            if to_number(record["stock"]) < to_number(safety):
+                append_row_format_request(sheet, index, INV_LAST_COL, STATUS_COLOR_UNPAID, requests)
+        except ValueError:
+            continue
+    if requests:
+        sheet.spreadsheet.batch_update({"requests": requests})
+
 def refresh_inventory(wb) -> dict:
+    movements_added = sync_transaction_inventory_movements(wb)
+    movement_sheet = get_or_create_inventory_movement_sheet(wb)
+    sort_inventory_movement_sheet(movement_sheet)
     sheet = get_or_create_inventory_sheet(wb)
     existing_names, existing_meta = read_inventory_meta(sheet)
-    stats = inventory_stats_from_transactions(wb)
+    stats = inventory_stats_from_movements(wb, update_balances=True)
 
     all_skus = []
     for sku in existing_names + PLANT_SKUS + sorted(stats):
@@ -2037,8 +2215,8 @@ def refresh_inventory(wb) -> dict:
         record = inventory_record_from_entry(sku, entry, existing_meta.get(sku, {}))
         records.append(record)
         rows.append([
-            record["sku"], record["stock"], record["unit"], record["avg_cost"],
-            record["last_purchase"], record["last_sale"], record["safety"], record["note"],
+            record["sku"], record["stock"], record["avg_cost"], record["inventory_value"],
+            record["safety"], record["inventory_days"], record["last_purchase"], record["last_sale"],
         ])
 
     if rows:
@@ -2048,10 +2226,12 @@ def refresh_inventory(wb) -> dict:
             value_input_option="RAW",
         )
         apply_alternating_row_colors_to(sheet, INV_LAST_COL, MIN_TRANSACTION_ROW + len(rows) - 1)
+        apply_inventory_safety_formats(sheet, records)
 
     return {
         "ok": True,
         "updated": len(rows),
+        "movements_added": movements_added,
         "records": records,
     }
 
@@ -2107,8 +2287,10 @@ def format_inventory_reply(records: list[dict], query: str = "") -> str:
         lines = [
             f"📦 庫存｜{record['sku']}",
             "─" * 22,
-            f"目前庫存｜{inventory_number(record['stock'])} {record['unit']}",
+            f"目前庫存｜{inventory_number(record['stock'])}",
             f"平均進價｜NT$ {inventory_number(record['avg_cost'])}",
+            f"庫存價值｜NT$ {inventory_number(record['inventory_value'])}",
+            f"庫存天數｜{inventory_number(record['inventory_days'])}",
             f"最近進貨｜{record['last_purchase'] or '-'}",
             f"最近售出｜{record['last_sale'] or '-'}",
             f"安全水位｜{record['safety'] or '-'}",
@@ -2116,16 +2298,15 @@ def format_inventory_reply(records: list[dict], query: str = "") -> str:
         warning = safety_warning(record)
         if warning:
             lines.append(warning)
-        if record["note"]:
-            lines.append(f"備註｜{record['note']}")
         return "\n".join(lines)
 
     lines = ["📦 庫存總覽", "─" * 22]
     for record in records:
         stock = inventory_number(record["stock"])
         avg_cost = inventory_number(record["avg_cost"])
+        inventory_value = inventory_number(record["inventory_value"])
         warning = " ⚠️" if safety_warning(record) else ""
-        lines.append(f"{record['sku']}｜{stock}{record['unit']}｜均價 {avg_cost}{warning}")
+        lines.append(f"{record['sku']}｜{stock}｜均價 {avg_cost}｜價值 {inventory_value}{warning}")
     lines.append("─" * 22)
     lines.append("查單一品種：庫存 三黃")
     return "\n".join(lines)
@@ -2142,11 +2323,13 @@ def format_inventory_movement_reply(result: dict) -> str:
         f"品種｜{result['sku']}",
         f"類型｜{result['movement_type']}",
         f"原因｜{result['reason']}",
-        f"數量變化｜{qty_text} {result['unit']}",
-        f"異動前｜{inventory_number(result['before'])} {result['unit']}",
-        f"異動後｜{inventory_number(result['after'])} {result['unit']}",
+        f"數量變化｜{qty_text}",
+        f"異動前｜{inventory_number(result['before'])}",
+        f"異動後｜{inventory_number(result['after'])}",
         f"平均進價｜NT$ {inventory_number(result['avg_cost'])}",
     ]
+    if result.get("related_tx_id"):
+        lines.append(f"關聯交易｜{result['related_tx_id']}")
     if result.get("negative_stock"):
         lines.append("⚠️ 異動後庫存為負數，請檢查交易或盤點資料")
     return "\n".join(lines)
@@ -2508,6 +2691,7 @@ HELP_TEXT = """溫室帳目機器人
 植物庫存：輸入「整理」、每日排程或查詢「庫存」時更新
 種苗收入／支出且有數量：自動寫入「📎 庫存異動」並關聯交易編號
 手動庫存異動：只調整數量，不改變平均進價
+目前庫存、平均進價、庫存價值、庫存天數與最近進售日期：皆由「📎 庫存異動」計算
 每筆交易會自動產生固定交易編號，例如 TX-0001
 更新與刪除請用交易編號，排序後也不會更新錯筆
 
@@ -2525,12 +2709,14 @@ HELP_TEXT = """溫室帳目機器人
 品項:三黃
 數量:2
 原因:死亡
+關聯交易編號:TX-0001
 備註:高溫損耗
 
 原因只能填：盤虧 / 盤盈 / 死亡 / 繁衍
 盤虧、死亡：庫存自動扣減
 盤盈、繁衍：庫存自動增加
 數量請填正數；手動異動不影響平均進價
+關聯交易編號、備註均為選填
 
 【更新付款狀態】
 更新 交易編號 已收
@@ -2575,6 +2761,7 @@ def refresh_receivables_job() -> dict:
         "purged_transactions": purged_transactions,
         "purged_receivables": purged_receivables,
         "inventory_updated": inventory_result.get("updated", 0),
+        "inventory_movements_added": inventory_result.get("movements_added", 0),
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -2612,6 +2799,7 @@ def refresh_receivables_route():
             "purged_transactions": result.get("purged_transactions", 0),
             "purged_receivables": result.get("purged_receivables", 0),
             "inventory_updated": result.get("inventory_updated", 0),
+            "inventory_movements_added": result.get("inventory_movements_added", 0),
         }
     except Exception:
         logger.exception("Scheduled receivables refresh failed")
@@ -2669,6 +2857,7 @@ def handle_message(event):
                     f"補上交易編號｜{result.get('ids_added', 0)} 筆\n"
                     f"移除逾期刪除交易｜{result.get('purged_transactions', 0)} 筆\n"
                     f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆\n"
+                    f"補上庫存異動｜{result.get('inventory_movements_added', 0)} 筆\n"
                     f"更新庫存品種｜{result.get('inventory_updated', 0)} 筆"
                 )
             except Exception:
@@ -2686,6 +2875,7 @@ def handle_message(event):
                     "品項:三黃\n"
                     "數量:2\n"
                     "原因:盤虧/盤盈/死亡/繁衍\n"
+                    "關聯交易編號:TX-0001（選填）\n"
                     "備註:選填\n\n"
                     "數量請填正數，系統會依原因自動判斷加減。"
                 )
@@ -2693,7 +2883,7 @@ def handle_message(event):
                 try:
                     wb = get_workbook()
                     result = apply_manual_inventory_movement(wb, movement_cmd)
-                    reply = format_inventory_movement_reply(result)
+                    reply = format_inventory_movement_reply(result) if result["ok"] else f"❌ {result['error']}"
                 except Exception:
                     logger.exception("Manual inventory movement failed")
                     reply = "⚠️ 庫存異動寫入失敗，請稍後再試。"
