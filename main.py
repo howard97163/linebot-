@@ -125,12 +125,6 @@ MOVEMENT_SALE          = "銷售"
 MOVEMENT_LOSS          = "損耗"
 MOVEMENT_ADJUSTMENT    = "盤點調整"
 MOVEMENT_SELF_GROWN    = "入庫（自行繁殖）"
-MANUAL_MOVEMENT_REASONS = {
-    "盤虧": (MOVEMENT_ADJUSTMENT, -1),
-    "盤盈": (MOVEMENT_ADJUSTMENT, 1),
-    "死亡": (MOVEMENT_LOSS, -1),
-    "繁衍": (MOVEMENT_SELF_GROWN, 1),
-}
 
 RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
@@ -1051,7 +1045,7 @@ def parse_inventory_movement_command(text: str) -> dict | None:
     fields = extract_inventory_movement_fields(text)
     item = fields.get("item", "").strip()
     reason = fields.get("reason", "").strip()
-    if not item or reason not in MANUAL_MOVEMENT_REASONS:
+    if not item or not reason:
         return None
 
     sku = detect_plant_sku(item)
@@ -1059,13 +1053,12 @@ def parse_inventory_movement_command(text: str) -> dict | None:
         return None
 
     try:
-        qty = abs(to_number(fields.get("qty", "")))
+        qty = to_number(fields.get("qty", ""))
     except ValueError:
         return None
-    if qty <= 0:
+    if qty == 0:
         return None
 
-    movement_type, direction = MANUAL_MOVEMENT_REASONS[reason]
     movement_date = today_tw()
     if fields.get("date"):
         movement_date = parse_date_value(fields["date"], movement_date.year)
@@ -1077,14 +1070,16 @@ def parse_inventory_movement_command(text: str) -> dict | None:
         note += f"；{fields['note'].strip()}"
     related_tx_id = ""
     if fields.get("related_tx_id"):
-        related_tx_id = normalize_tx_id(fields["related_tx_id"])
-        if not related_tx_id:
-            return None
+        raw_related_tx_id = re.sub(r"\s+", "", fields["related_tx_id"]).upper()
+        if raw_related_tx_id != "TX-":
+            related_tx_id = normalize_tx_id(raw_related_tx_id)
+            if not related_tx_id:
+                return None
     return {
         "date": movement_date.strftime("%Y/%m/%d"),
         "sku": sku,
-        "movement_type": movement_type,
-        "qty_change": direction * qty,
+        "movement_type": MOVEMENT_ADJUSTMENT,
+        "qty_change": qty,
         "reason": reason,
         "related_tx_id": related_tx_id,
         "note": note,
@@ -2716,15 +2711,15 @@ HELP_TEXT = """溫室帳目機器人
 【手動庫存異動】
 庫存異動
 品項:三黃
-數量:2
+數量:-2
 原因:死亡
-關聯交易編號:TX-0001
+關聯交易編號:TX-
 備註:高溫損耗
 
-原因只能填：盤虧 / 盤盈 / 死亡 / 繁衍
-盤虧、死亡：庫存自動扣減
-盤盈、繁衍：庫存自動增加
-數量請填正數；手動異動不影響平均進價
+數量為正數：增加庫存；數量為負數：減少庫存
+原因可輸入任意文字，只作為紀錄，不影響增減方向
+手動異動統一記為「盤點調整」，不影響平均進價
+關聯交易編號保留 TX- 且未接編號時，系統會視同未填
 關聯交易編號、備註均為選填
 
 【更新付款狀態】
@@ -2882,11 +2877,11 @@ def handle_message(event):
                     "正確格式：\n"
                     "庫存異動\n"
                     "品項:三黃\n"
-                    "數量:2\n"
-                    "原因:盤虧/盤盈/死亡/繁衍\n"
-                    "關聯交易編號:TX-0001（選填）\n"
+                    "數量:-2\n"
+                    "原因:死亡\n"
+                    "關聯交易編號:TX-\n"
                     "備註:選填\n\n"
-                    "數量請填正數，系統會依原因自動判斷加減。"
+                    "數量正數會增加、負數會減少；原因可填任意文字。"
                 )
             else:
                 try:
