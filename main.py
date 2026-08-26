@@ -839,6 +839,7 @@ LABEL_ALIASES = {
     "日期": "date", "交易日期": "date",
     "期限": "due", "付款期限": "due", "到期日": "due",
     "數量": "qty", "数量": "qty",
+    # 保留舊單價標籤只為了正確切分舊訊息；標籤式輸入不再採用手動單價。
     "售出單價": "unit_price", "售價": "unit_price",
     "進貨單價": "cost", "進價": "cost", "进价": "cost", "成本": "cost",
     "人民幣": "rmb", "人民币": "rmb", "rmb": "rmb", "RMB": "rmb",
@@ -865,6 +866,25 @@ def extract_labeled_fields(text: str) -> dict:
         if key and value:
             fields[key] = value
     return fields
+
+def calculate_labeled_unit_prices(
+    tx_type: str,
+    amount: int,
+    qty: int,
+    category: str,
+) -> tuple[int | float, int | float]:
+    """依標籤式輸入規則回傳（售出單價, 進貨單價）。"""
+    if qty <= 0:
+        return 0, 0
+
+    calculated_price = amount / qty
+    calculated_price = int(calculated_price) if calculated_price.is_integer() else round(calculated_price, 2)
+
+    if tx_type == TX_INCOME:
+        return calculated_price, 0
+    if tx_type == TX_EXPENSE and category == "種苗銷售":
+        return 0, calculated_price
+    return 0, 0
 
 def parse_labeled_message(text: str) -> dict | None:
     fields = extract_labeled_fields(text)
@@ -921,14 +941,6 @@ def parse_labeled_message(text: str) -> dict | None:
         if due_date is None:
             return None
 
-    cost_per_unit = 0
-    if "cost" in fields:
-        try:
-            cost_value = number_from_field(fields["cost"])
-            cost_per_unit = cost_value if cost_value != "" else 0
-        except ValueError:
-            return None
-
     rmb = ""
     exchange_rate = ""
     if "rmb" in fields:
@@ -941,7 +953,7 @@ def parse_labeled_message(text: str) -> dict | None:
         else:
             rmb = ""
 
-    item_qty, item_unit_price = extract_qty_and_unit_price(item, amount)
+    item_qty, _ = extract_qty_and_unit_price(item, amount)
     qty = item_qty
     if "qty" in fields:
         try:
@@ -951,16 +963,13 @@ def parse_labeled_message(text: str) -> dict | None:
         if qty_value != "":
             qty = int(qty_value)
 
-    unit_price = item_unit_price
-    if "unit_price" in fields:
-        try:
-            unit_price_value = number_from_field(fields["unit_price"])
-        except ValueError:
-            return None
-        if unit_price_value != "":
-            unit_price = unit_price_value
-    elif qty and not unit_price:
-        unit_price = round(amount / qty) if qty > 0 else 0
+    category = guess_category(f"{item} {text}")
+    unit_price, cost_per_unit = calculate_labeled_unit_prices(
+        tx_type,
+        amount,
+        qty,
+        category,
+    )
 
     gross_profit = ""
     if tx_type == TX_INCOME and cost_per_unit > 0 and qty > 0:
@@ -968,7 +977,6 @@ def parse_labeled_message(text: str) -> dict | None:
 
     outstanding = amount - initial_collected if status == STATUS_PARTIAL else amount
     overdue_days = calculate_overdue_days(due_date, outstanding) if tx_type == TX_INCOME and status in (STATUS_UNPAID, STATUS_PARTIAL) else ""
-    category = guess_category(f"{item} {text}")
     raw_single_line = " ".join(l.strip() for l in text.splitlines() if l.strip())
 
     return {
@@ -2639,10 +2647,8 @@ HELP_TEXT = """溫室帳目機器人
 日期：7/1
 類型：收入
 金額：50000
-品項：珍妮
+品項：三黃
 數量：500棵
-售出單價：100
-進貨單價：30
 客戶：李淵男
 狀態：未付
 期限：7/31
@@ -2657,7 +2663,6 @@ HELP_TEXT = """溫室帳目機器人
 數量：
 廠商：
 狀態：已付
-期限：
 
 【可選欄位說明】
 付款狀態：已收 / 已付 / 未付 / 部分收
@@ -2665,11 +2670,12 @@ HELP_TEXT = """溫室帳目機器人
 收入期限留空：預設交易日起1個月
 部分收款：已收：30000
 數量：數量：500棵 / 數量：500
-售出單價：售出單價：100
-進貨單價：進貨單價：30
+收入售出單價：由金額 ÷ 數量自動計算，不用輸入
+種苗支出進貨單價：一律由金額 ÷ 數量自動計算，不接受手動覆寫
+非種苗支出：進貨單價欄保持空白
 外匯：人民幣：4000 / RMB：4000
 
-可用標籤：日期、類型、金額、品項、數量、售出單價、進貨單價、客戶、廠商、狀態、期限、人民幣、已收、備註
+可用標籤：日期、類型、金額、品項、數量、客戶、廠商、狀態、期限、人民幣、已收、備註
 標籤格式必填：類型、金額、品項
 舊格式如「收入 50000 品項 客戶」已停用
 
@@ -2685,6 +2691,9 @@ HELP_TEXT = """溫室帳目機器人
 未輸入日期：預設今天
 收入未輸入狀態：預設未付
 支出未輸入狀態：預設已付
+收入有數量：售出單價自動以金額 ÷ 數量計算
+種苗銷售支出有數量：進貨單價一律以金額 ÷ 數量計算
+非種苗銷售支出：不寫入進貨單價
 已收/已付：付款日期預設為交易日期
 未付/部分收收入：自動同步應收帳款
 客戶分析與月份總覽：輸入「整理」或每日排程時更新
@@ -2983,11 +2992,11 @@ def handle_message(event):
                     "日期：7/1\n"
                     "類型：收入\n"
                     "金額：50000\n"
-                    "品項：珍妮\n"
+                    "品項：三黃\n"
                     "數量：500棵\n"
-                    "售出單價：100\n"
-                    "進貨單價：30\n"
-                    "客戶：李淵男\n\n"
+                    "客戶：李淵男\n"
+                    "狀態：未付\n"
+                    "期限：\n\n"
                     "更新收款請輸入：更新 TX-0001 已收\n\n"
                     "輸入「說明」查看完整格式"
                 )
