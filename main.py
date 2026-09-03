@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import calendar
+import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -46,6 +47,7 @@ SHEET_MONTHLY_OVERVIEW = "📊 月份總覽"
 SHEET_CUSTOMER_ANALYSIS = "👥 客戶分析"
 SHEET_INVENTORY = "📦 庫存"
 SHEET_INVENTORY_MOVEMENTS = "📎 庫存異動"
+SHEET_WEBHOOK_EVENTS = "🔒 Webhook防重紀錄"
 
 TX_INCOME   = "收入"
 TX_EXPENSE  = "支出"
@@ -129,12 +131,24 @@ MOVEMENT_SELF_GROWN    = "入庫（自行繁殖）"
 RECENT_MESSAGE_ID_LIMIT = 500
 _recent_message_ids     = deque(maxlen=RECENT_MESSAGE_ID_LIMIT)
 _recent_message_id_set: set[str] = set()
+_sheet_write_lock = threading.RLock()
 MIN_TRANSACTION_ROW = 3
 TX_LAST_COL = COL_DELETED_AT
 RECV_LAST_COL = RECV_COL_DELETED_AT
 MONTHLY_LAST_COL = 19
 INV_LAST_COL = INV_COL_LAST_SALE
 MOV_LAST_COL = MOV_COL_NOTE
+EVENT_COL_KEY = 1
+EVENT_COL_WEBHOOK_ID = 2
+EVENT_COL_MESSAGE_ID = 3
+EVENT_COL_STATUS = 4
+EVENT_COL_TX_ID = 5
+EVENT_COL_UPDATED_AT = 6
+EVENT_COL_USER_ID = 7
+EVENT_LAST_COL = EVENT_COL_USER_ID
+EVENT_STATUS_PROCESSING = "處理中"
+EVENT_STATUS_TRANSACTION_WRITTEN = "交易已寫入"
+EVENT_STATUS_COMPLETED = "完成"
 ROW_COLOR_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 ROW_COLOR_GREEN = {"red": 0.91, "green": 0.97, "blue": 0.94}
 ROW_COLOR_DELETED = {"red": 0.82, "green": 0.82, "blue": 0.82}
@@ -207,6 +221,14 @@ def range_a1(start_row: int, start_col: int, end_row: int, end_col: int) -> str:
 TX_ID_PATTERN = re.compile(r"^TX-(\d+)$", re.IGNORECASE)
 MOVEMENT_ID_PATTERN = re.compile(r"^INV-(\d+)$", re.IGNORECASE)
 
+
+class DuplicateIdentifierError(RuntimeError):
+    """試算表中同一個固定編號出現超過一次。"""
+
+
+class IdentifierReadError(RuntimeError):
+    """無法可靠讀取編號欄；必須停止寫入，不能從 0001 重新開始。"""
+
 def format_tx_id(n: int) -> str:
     return f"TX-{n:04d}"
 
@@ -231,8 +253,8 @@ def next_tx_id(sheet) -> str:
     max_n = 0
     try:
         col_values = sheet.col_values(COL_TX_ID)
-    except Exception:
-        col_values = []
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取交易編號欄，已停止寫入以避免產生 TX-0001") from exc
     for v in col_values:
         normalized = normalize_tx_id(v)
         if normalized:
@@ -250,42 +272,93 @@ def next_movement_id(sheet) -> str:
     max_n = 0
     try:
         col_values = sheet.col_values(MOV_COL_ID)
-    except Exception:
-        col_values = []
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取庫存異動編號欄，已停止寫入以避免產生 INV-0001") from exc
     for value in col_values:
         max_n = max(max_n, movement_id_number(value))
     return format_movement_id(max_n + 1)
 
-def find_row_by_tx_id(sheet, tx_id: str) -> int:
+def find_rows_by_tx_id(sheet, tx_id: str) -> list[int]:
     normalized = normalize_tx_id(tx_id)
     if not normalized:
-        return 0
+        return []
     try:
         col_values = sheet.col_values(COL_TX_ID)
-    except Exception:
-        return 0
-    for row_num, value in enumerate(col_values, start=1):
-        if normalize_tx_id(value) == normalized:
-            return row_num
-    return 0
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取交易編號欄，已停止操作") from exc
+    return [
+        row_num
+        for row_num, value in enumerate(col_values, start=1)
+        if row_num >= MIN_TRANSACTION_ROW and normalize_tx_id(value) == normalized
+    ]
 
-def ensure_transaction_ids(sheet) -> int:
-    values = sheet.get_all_values()
-    next_n = tx_id_number(next_tx_id(sheet))
-    updates = []
-    for row_num in range(MIN_TRANSACTION_ROW, last_data_row(values) + 1):
-        row = values[row_num - 1] if len(values) >= row_num else []
-        existing = row[COL_TX_ID - 1] if len(row) >= COL_TX_ID else ""
-        if normalize_tx_id(existing):
+
+def find_row_by_tx_id(sheet, tx_id: str) -> int:
+    rows = find_rows_by_tx_id(sheet, tx_id)
+    if len(rows) > 1:
+        normalized = normalize_tx_id(tx_id) or str(tx_id)
+        raise DuplicateIdentifierError(
+            f"交易編號 {normalized} 重複出現在第 {', '.join(map(str, rows))} 列"
+        )
+    return rows[0] if rows else 0
+
+
+def duplicate_ids_in_column(sheet, column: int, normalizer, first_row: int = MIN_TRANSACTION_ROW) -> dict[str, list[int]]:
+    try:
+        values = sheet.col_values(column)
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取編號欄，重複編號檢查未完成") from exc
+    locations: dict[str, list[int]] = {}
+    for row_num, value in enumerate(values, start=1):
+        if row_num < first_row:
             continue
-        updates.append({
-            "range": cell_a1(row_num, COL_TX_ID),
-            "values": [[format_tx_id(next_n)]],
-        })
-        next_n += 1
-    if updates:
-        sheet.batch_update(updates)
-    return len(updates)
+        normalized = normalizer(value)
+        if normalized:
+            locations.setdefault(normalized, []).append(row_num)
+    return {identifier: rows for identifier, rows in locations.items() if len(rows) > 1}
+
+
+def duplicate_transaction_ids(sheet) -> dict[str, list[int]]:
+    return duplicate_ids_in_column(sheet, COL_TX_ID, normalize_tx_id)
+
+
+def normalize_movement_id(value: str) -> str | None:
+    number = movement_id_number(value)
+    return format_movement_id(number) if number else None
+
+
+def duplicate_movement_ids(sheet) -> dict[str, list[int]]:
+    return duplicate_ids_in_column(sheet, MOV_COL_ID, normalize_movement_id)
+
+
+def duplicate_id_summary(duplicates: dict[str, list[int]], limit: int = 8) -> str:
+    items = [
+        f"{identifier}（列 {', '.join(map(str, rows))}）"
+        for identifier, rows in sorted(duplicates.items())[:limit]
+    ]
+    if len(duplicates) > limit:
+        items.append(f"另有 {len(duplicates) - limit} 組")
+    return "、".join(items)
+
+def ensure_transaction_ids(sheet, reserved_tx_ids=()) -> int:
+    with _sheet_write_lock:
+        values = sheet.get_all_values()
+        max_reserved = max((tx_id_number(value) for value in reserved_tx_ids), default=0)
+        next_n = max(tx_id_number(next_tx_id(sheet)), max_reserved + 1)
+        updates = []
+        for row_num in range(MIN_TRANSACTION_ROW, last_data_row(values) + 1):
+            row = values[row_num - 1] if len(values) >= row_num else []
+            existing = row[COL_TX_ID - 1] if len(row) >= COL_TX_ID else ""
+            if normalize_tx_id(existing):
+                continue
+            updates.append({
+                "range": cell_a1(row_num, COL_TX_ID),
+                "values": [[format_tx_id(next_n)]],
+            })
+            next_n += 1
+        if updates:
+            sheet.batch_update(updates)
+        return len(updates)
 
 def parse_date_value(value: str, default_year: int | None = None):
     value = value.strip()
@@ -650,6 +723,148 @@ def remember_message(mid):
         _recent_message_id_set.discard(_recent_message_ids[0])
     _recent_message_ids.append(mid)
     _recent_message_id_set.add(mid)
+
+
+def app_now_text() -> str:
+    return datetime.now(get_app_timezone()).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def webhook_event_identity(event) -> tuple[str, str, str]:
+    webhook_id = str(getattr(event, "webhook_event_id", "") or "").strip()
+    message_id = str(getattr(event.message, "id", "") or "").strip()
+    if webhook_id:
+        return f"webhook:{webhook_id}", webhook_id, message_id
+    if message_id:
+        return f"message:{message_id}", "", message_id
+    raise RuntimeError("無法取得 LINE webhookEventId 或 message ID，已停止寫入以避免重複交易")
+
+
+def get_or_create_webhook_event_sheet(wb):
+    try:
+        return wb.worksheet(SHEET_WEBHOOK_EVENTS)
+    except gspread.WorksheetNotFound:
+        sheet = wb.add_worksheet(title=SHEET_WEBHOOK_EVENTS, rows=1000, cols=EVENT_LAST_COL)
+        sheet.update(
+            range_a1(1, 1, 1, EVENT_LAST_COL),
+            [["事件鍵", "webhookEventId", "message ID", "處理狀態", "交易編號", "更新時間", "LINE User ID"]],
+            value_input_option="RAW",
+        )
+        return sheet
+
+
+def webhook_event_record(sheet, event_key: str) -> dict | None:
+    try:
+        values = sheet.get_all_values()
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取 Webhook 防重紀錄，已停止寫入") from exc
+    matches = []
+    for row_num, row in enumerate(values[1:], start=2):
+        key = row[EVENT_COL_KEY - 1].strip() if len(row) >= EVENT_COL_KEY else ""
+        if key == event_key:
+            matches.append((row_num, row))
+    if len(matches) > 1:
+        raise DuplicateIdentifierError(
+            f"Webhook 事件鍵重複出現在第 {', '.join(str(item[0]) for item in matches)} 列"
+        )
+    if not matches:
+        return None
+    row_num, row = matches[0]
+    return {
+        "row_num": row_num,
+        "event_key": event_key,
+        "status": row[EVENT_COL_STATUS - 1] if len(row) >= EVENT_COL_STATUS else "",
+        "tx_id": normalize_tx_id(row[EVENT_COL_TX_ID - 1]) if len(row) >= EVENT_COL_TX_ID else None,
+    }
+
+
+def reserved_webhook_tx_ids(sheet) -> list[str]:
+    try:
+        values = sheet.col_values(EVENT_COL_TX_ID)
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取 Webhook 已保留的交易編號，已停止配置新編號") from exc
+    return [normalized for value in values[1:] if (normalized := normalize_tx_id(value))]
+
+
+def next_event_safe_tx_id(tx_sheet, event_sheet) -> str:
+    transaction_next = tx_id_number(next_tx_id(tx_sheet))
+    reserved_ids = reserved_webhook_tx_ids(event_sheet)
+    max_reserved = max((tx_id_number(value) for value in reserved_ids), default=0)
+    return format_tx_id(max(transaction_next, max_reserved + 1))
+
+
+def reserve_transaction_event(
+    wb,
+    event_key: str,
+    webhook_id: str,
+    message_id: str,
+    user_id: str,
+) -> dict:
+    """先永久保留事件與 TX-ID；若寫入途中重啟，重送事件會沿用同一編號。"""
+    with _sheet_write_lock:
+        event_sheet = get_or_create_webhook_event_sheet(wb)
+        tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+        record = webhook_event_record(event_sheet, event_key)
+
+        if record:
+            tx_id = record.get("tx_id")
+            if not tx_id:
+                tx_id = next_event_safe_tx_id(tx_sheet, event_sheet)
+                if find_rows_by_tx_id(tx_sheet, tx_id):
+                    raise DuplicateIdentifierError(f"準備使用的交易編號 {tx_id} 已存在")
+                event_sheet.batch_update([
+                    {"range": cell_a1(record["row_num"], EVENT_COL_TX_ID), "values": [[tx_id]]},
+                    {"range": cell_a1(record["row_num"], EVENT_COL_UPDATED_AT), "values": [[app_now_text()]]},
+                ])
+                record["tx_id"] = tx_id
+
+            tx_rows = find_rows_by_tx_id(tx_sheet, tx_id)
+            if len(tx_rows) > 1:
+                raise DuplicateIdentifierError(
+                    f"保留的交易編號 {tx_id} 已重複出現在第 {', '.join(map(str, tx_rows))} 列"
+                )
+            if record.get("status") == EVENT_STATUS_COMPLETED and not tx_rows:
+                raise RuntimeError(f"Webhook 紀錄顯示 {tx_id} 已完成，但交易列不存在，請人工檢查")
+            return {
+                "event_row": record["row_num"],
+                "tx_id": tx_id,
+                "already_written": bool(tx_rows),
+                "tx_row": tx_rows[0] if tx_rows else 0,
+            }
+
+        tx_id = next_event_safe_tx_id(tx_sheet, event_sheet)
+        if find_rows_by_tx_id(tx_sheet, tx_id):
+            raise DuplicateIdentifierError(f"準備使用的交易編號 {tx_id} 已存在")
+        event_sheet.append_row([
+            event_key,
+            webhook_id,
+            message_id,
+            EVENT_STATUS_PROCESSING,
+            tx_id,
+            app_now_text(),
+            user_id,
+        ], value_input_option="RAW", insert_data_option="INSERT_ROWS")
+        record = webhook_event_record(event_sheet, event_key)
+        if not record or record.get("tx_id") != tx_id:
+            raise RuntimeError("Webhook 防重保留失敗，交易未寫入")
+        return {
+            "event_row": record["row_num"],
+            "tx_id": tx_id,
+            "already_written": False,
+            "tx_row": 0,
+        }
+
+
+def set_webhook_event_status(wb, event_key: str, status: str, tx_id: str) -> None:
+    with _sheet_write_lock:
+        sheet = get_or_create_webhook_event_sheet(wb)
+        record = webhook_event_record(sheet, event_key)
+        if not record:
+            raise RuntimeError("找不到 Webhook 防重保留紀錄")
+        sheet.batch_update([
+            {"range": cell_a1(record["row_num"], EVENT_COL_STATUS), "values": [[status]]},
+            {"range": cell_a1(record["row_num"], EVENT_COL_TX_ID), "values": [[tx_id]]},
+            {"range": cell_a1(record["row_num"], EVENT_COL_UPDATED_AT), "values": [[app_now_text()]]},
+        ])
 
 def is_allowed_user(event) -> bool:
     if not ALLOWED_USER_IDS:
@@ -1257,6 +1472,23 @@ def parse_restore_command(text: str) -> dict | None:
 def receivable_note(raw: str, tx_id: str) -> str:
     return f"[{tx_id}] {raw}".strip()
 
+
+def receivable_row_by_tx_id(all_recv: list[list[str]], tx_id: str) -> int | None:
+    marker = f"[{tx_id}]"
+    rows = [
+        row_num
+        for row_num, row in enumerate(all_recv, start=1)
+        if row_num >= MIN_TRANSACTION_ROW
+        and len(row) >= RECV_COL_NOTE
+        and marker in row[RECV_COL_NOTE - 1]
+    ]
+    if len(rows) > 1:
+        raise DuplicateIdentifierError(
+            f"應收帳款中交易編號 {tx_id} 重複出現在第 {', '.join(map(str, rows))} 列"
+        )
+    return rows[0] if rows else None
+
+
 def find_receivable_row(all_recv: list[list[str]], tx_id: str, customer: str, item: str, amount: int, raw: str = "") -> int | None:
     marker = f"[{tx_id}]"
     raw_matches = []
@@ -1290,7 +1522,10 @@ def find_receivable_row(all_recv: list[list[str]], tx_id: str, customer: str, it
 # ══════════════════════════════════════════════════════════════
 def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) -> dict:
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    try:
+        row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    except DuplicateIdentifierError as exc:
+        return {"ok": False, "error": f"{exc}；為避免更新錯筆，本次操作已停止"}
     if not row_num or row_num < MIN_TRANSACTION_ROW:
         return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
     row_data  = tx_sheet.row_values(row_num)
@@ -1428,7 +1663,10 @@ def apply_status_update(wb, tx_id: str, new_status: str, collected: int | None) 
 
 def apply_delete_transaction(wb, tx_id: str) -> dict:
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    try:
+        row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    except DuplicateIdentifierError as exc:
+        return {"ok": False, "error": f"{exc}；為避免刪除錯筆，本次操作已停止"}
     if not row_num or row_num < MIN_TRANSACTION_ROW:
         return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
     row_data = tx_sheet.row_values(row_num)
@@ -1489,7 +1727,10 @@ def apply_delete_transaction(wb, tx_id: str) -> dict:
 
 def apply_restore_transaction(wb, tx_id: str) -> dict:
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    try:
+        row_num = find_row_by_tx_id(tx_sheet, tx_id)
+    except DuplicateIdentifierError as exc:
+        return {"ok": False, "error": f"{exc}；為避免恢復錯筆，本次操作已停止"}
     if not row_num or row_num < MIN_TRANSACTION_ROW:
         return {"ok": False, "error": f"找不到交易編號 {tx_id}，請確認編號是否正確"}
     row_data = tx_sheet.row_values(row_num)
@@ -1566,21 +1807,62 @@ def purge_soft_deleted_rows(sheet, deleted_col: int, retention_days: int = 30) -
 # ══════════════════════════════════════════════════════════════
 # 寫入新交易
 # ══════════════════════════════════════════════════════════════
-def append_transaction(wb, data: dict) -> tuple[int, str]:
-    sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    tx_id = next_tx_id(sheet)
-    data["tx_id"] = tx_id
-    row = [
-        data["date"], data["type"], data["amount"], data["item"],
-        data["customer"], data["status"], data["pay_date"],
-        data["qty"], data["unit_price"], data["cost_per_unit"],
-        data["gross_profit"], data["channel"], data["days_to_collect"],
-        data["note"], data["category"], data["cost_structure"],
-        data["month"], data["rmb"], data["exchange_rate"], data["raw"], tx_id, "",
-    ]
-    sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-    sorted_row_num = organize_transaction_sheet(sheet, data)
-    return (sorted_row_num if sorted_row_num else len(sheet.col_values(1)), tx_id)
+def append_transaction(wb, data: dict, reserved_tx_id: str = "") -> tuple[int, str]:
+    with _sheet_write_lock:
+        sheet = wb.worksheet(SHEET_TRANSACTIONS)
+        tx_id = normalize_tx_id(reserved_tx_id) if reserved_tx_id else next_tx_id(sheet)
+        if not tx_id:
+            raise RuntimeError("保留的交易編號格式不正確")
+
+        # 寫入前檢查：新編號必須尚未存在。
+        existing_rows = find_rows_by_tx_id(sheet, tx_id)
+        if existing_rows:
+            raise DuplicateIdentifierError(
+                f"交易編號 {tx_id} 寫入前已存在於第 {', '.join(map(str, existing_rows))} 列"
+            )
+
+        data["tx_id"] = tx_id
+        row = [
+            data["date"], data["type"], data["amount"], data["item"],
+            data["customer"], data["status"], data["pay_date"],
+            data["qty"], data["unit_price"], data["cost_per_unit"],
+            data["gross_profit"], data["channel"], data["days_to_collect"],
+            data["note"], data["category"], data["cost_structure"],
+            data["month"], data["rmb"], data["exchange_rate"], data["raw"], tx_id, "",
+        ]
+        sheet.append_row(row, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+
+        # 寫入後再次檢查；不是剛好一列就停止後續同步。
+        written_rows = find_rows_by_tx_id(sheet, tx_id)
+        if len(written_rows) != 1:
+            raise DuplicateIdentifierError(
+                f"交易編號 {tx_id} 寫入後出現 {len(written_rows)} 筆，已停止後續同步"
+            )
+        sorted_row_num = organize_transaction_sheet(sheet, data)
+        return (sorted_row_num if sorted_row_num else written_rows[0], tx_id)
+
+
+def append_transaction_for_event(
+    wb,
+    data: dict,
+    event_key: str,
+    webhook_id: str,
+    message_id: str,
+    user_id: str,
+) -> tuple[int, str, bool]:
+    """以永久事件紀錄保留 TX-ID，防止 LINE 重送或 Railway 重啟後重複寫入。"""
+    with _sheet_write_lock:
+        reservation = reserve_transaction_event(
+            wb, event_key, webhook_id, message_id, user_id
+        )
+        tx_id = reservation["tx_id"]
+        if reservation["already_written"]:
+            return reservation["tx_row"], tx_id, True
+        row_num, tx_id = append_transaction(wb, data, reserved_tx_id=tx_id)
+        set_webhook_event_status(
+            wb, event_key, EVENT_STATUS_TRANSACTION_WRITTEN, tx_id
+        )
+        return row_num, tx_id, False
 
 def update_receivables(wb, data: dict, tx_id: str) -> bool:
     if data["type"] != TX_INCOME:
@@ -1590,6 +1872,12 @@ def update_receivables(wb, data: dict, tx_id: str) -> bool:
 
     sheet      = wb.worksheet(SHEET_RECEIVABLES)
     all_values = sheet.get_all_values()
+
+    # Webhook 重送或伺服器在交易寫入後重啟時，沿用 TX-ID 並補做同步，
+    # 但已存在的應收列不能再新增一次。
+    existing_row = receivable_row_by_tx_id(all_values, tx_id)
+    if existing_row:
+        return False
 
     # 找到「合計未收」那行，新資料插入在它上方
     insert_at = len(all_values) + 1  # 預設：找不到就附加在最後
@@ -1724,7 +2012,7 @@ def get_or_create_inventory_movement_sheet(wb):
             "庫存異動",
             "📦 庫存異動",
         )
-    except Exception:
+    except gspread.WorksheetNotFound:
         sheet = wb.add_worksheet(title=SHEET_INVENTORY_MOVEMENTS, rows=200, cols=MOV_LAST_COL)
 
     sheet.update(
@@ -1746,8 +2034,8 @@ def inventory_movement_exists_for_tx(sheet, tx_id: str, movement_type: str = "")
         return False
     try:
         values = sheet.get_all_values()
-    except Exception:
-        return False
+    except Exception as exc:
+        raise IdentifierReadError("無法讀取庫存異動，已停止寫入以避免重複") from exc
     for row in values[MIN_TRANSACTION_ROW - 1:]:
         row_tx_id = row[MOV_COL_TX_ID - 1] if len(row) >= MOV_COL_TX_ID else ""
         row_type = row[MOV_COL_TYPE - 1] if len(row) >= MOV_COL_TYPE else ""
@@ -1767,24 +2055,44 @@ def append_inventory_movement_row(
     tx_id: str = "",
     note: str = "",
 ) -> str:
-    movement_id = next_movement_id(sheet)
-    sheet.append_row([
-        movement_id,
-        movement_date,
-        sku,
-        movement_type,
-        rounded_amount(qty_change),
-        rounded_amount(balance),
-        tx_id,
-        note,
-    ], value_input_option="RAW", insert_data_option="INSERT_ROWS")
-    row_num = len(sheet.col_values(MOV_COL_ID))
-    apply_alternating_row_colors_to(sheet, MOV_LAST_COL, row_num)
-    return movement_id
+    with _sheet_write_lock:
+        movement_id = next_movement_id(sheet)
+        if duplicate_ids_in_column(sheet, MOV_COL_ID, normalize_movement_id):
+            raise DuplicateIdentifierError("庫存異動表已有重複 INV 編號，已停止新增")
+        existing_ids = sheet.col_values(MOV_COL_ID)
+        if any(normalize_movement_id(value) == movement_id for value in existing_ids):
+            raise DuplicateIdentifierError(f"庫存異動編號 {movement_id} 寫入前已存在")
+        sheet.append_row([
+            movement_id,
+            movement_date,
+            sku,
+            movement_type,
+            rounded_amount(qty_change),
+            rounded_amount(balance),
+            tx_id,
+            note,
+        ], value_input_option="RAW", insert_data_option="INSERT_ROWS")
+        id_values = sheet.col_values(MOV_COL_ID)
+        written_rows = [
+            row_num
+            for row_num, value in enumerate(id_values, start=1)
+            if row_num >= MIN_TRANSACTION_ROW and normalize_movement_id(value) == movement_id
+        ]
+        if len(written_rows) != 1:
+            raise DuplicateIdentifierError(
+                f"庫存異動編號 {movement_id} 寫入後出現 {len(written_rows)} 筆，已停止後續同步"
+            )
+        apply_alternating_row_colors_to(sheet, MOV_LAST_COL, written_rows[0])
+        return movement_id
 
 def inventory_transaction_records(wb) -> dict:
     """建立 TX-ID 對應的植物交易資料，供異動同步、成本與軟刪除判斷使用。"""
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+    duplicates = duplicate_transaction_ids(tx_sheet)
+    if duplicates:
+        raise DuplicateIdentifierError(
+            "交易記錄已有重複編號：" + duplicate_id_summary(duplicates)
+        )
     values = tx_sheet.get_all_values()
     records = {}
     for row in values[MIN_TRANSACTION_ROW - 1:]:
@@ -1876,11 +2184,27 @@ def sort_inventory_movement_sheet(sheet):
     })
 
 def sync_transaction_inventory_movements(wb, exclude_tx_id: str = "") -> int:
+    with _sheet_write_lock:
+        return _sync_transaction_inventory_movements_locked(wb, exclude_tx_id)
+
+
+def _sync_transaction_inventory_movements_locked(wb, exclude_tx_id: str = "") -> int:
     """補齊有效植物交易的自動異動；既有 INV-ID 不變，也不重複建立。"""
     tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    ensure_transaction_ids(tx_sheet)
+    event_sheet = get_or_create_webhook_event_sheet(wb)
+    ensure_transaction_ids(tx_sheet, reserved_webhook_tx_ids(event_sheet))
+    tx_duplicates = duplicate_transaction_ids(tx_sheet)
+    if tx_duplicates:
+        raise DuplicateIdentifierError(
+            "交易記錄已有重複編號：" + duplicate_id_summary(tx_duplicates)
+        )
     records = inventory_transaction_records(wb)
     sheet = get_or_create_inventory_movement_sheet(wb)
+    movement_duplicates = duplicate_movement_ids(sheet)
+    if movement_duplicates:
+        raise DuplicateIdentifierError(
+            "庫存異動已有重複編號：" + duplicate_id_summary(movement_duplicates)
+        )
     exclude_tx_id = normalize_tx_id(exclude_tx_id) if exclude_tx_id else ""
 
     existing = set()
@@ -1919,10 +2243,20 @@ def sync_transaction_inventory_movements(wb, exclude_tx_id: str = "") -> int:
 
     if rows:
         sheet.append_rows(rows, value_input_option="RAW")
+        movement_duplicates = duplicate_movement_ids(sheet)
+        if movement_duplicates:
+            raise DuplicateIdentifierError(
+                "補登後發現重複庫存異動編號：" + duplicate_id_summary(movement_duplicates)
+            )
         sort_inventory_movement_sheet(sheet)
     return len(rows)
 
 def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
+    with _sheet_write_lock:
+        return _append_transaction_inventory_movement_locked(wb, data, tx_id)
+
+
+def _append_transaction_inventory_movement_locked(wb, data: dict, tx_id: str) -> dict:
     qty = data.get("qty", 0)
     try:
         qty = to_number(qty) if qty not in ("", None) else 0
@@ -1947,8 +2281,6 @@ def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
     else:
         return {"added": False, "reason": "not_inventory_transaction"}
 
-    # 先補齊過去尚未建立的交易異動，但排除本次交易，讓本次回覆能取得新 INV-ID。
-    sync_transaction_inventory_movements(wb, exclude_tx_id=tx_id)
     sheet = get_or_create_inventory_movement_sheet(wb)
     if inventory_movement_exists_for_tx(sheet, tx_id, movement_type):
         return {"added": False, "reason": "already_exists"}
@@ -1982,12 +2314,20 @@ def append_transaction_inventory_movement(wb, data: dict, tx_id: str) -> dict:
     }
 
 def apply_manual_inventory_movement(wb, command: dict) -> dict:
+    with _sheet_write_lock:
+        return _apply_manual_inventory_movement_locked(wb, command)
+
+
+def _apply_manual_inventory_movement_locked(wb, command: dict) -> dict:
     sku = command["sku"]
     qty_change = command["qty_change"]
     related_tx_id = command.get("related_tx_id", "")
     if related_tx_id:
         tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-        tx_row_num = find_row_by_tx_id(tx_sheet, related_tx_id)
+        try:
+            tx_row_num = find_row_by_tx_id(tx_sheet, related_tx_id)
+        except DuplicateIdentifierError as exc:
+            return {"ok": False, "error": f"{exc}；無法安全建立關聯"}
         if not tx_row_num:
             return {"ok": False, "error": f"找不到關聯交易編號 {related_tx_id}"}
         tx_row = tx_sheet.row_values(tx_row_num)
@@ -2040,7 +2380,7 @@ def inventory_empty_entry() -> dict:
 def get_or_create_inventory_sheet(wb):
     try:
         sheet = wb.worksheet(SHEET_INVENTORY)
-    except Exception:
+    except gspread.WorksheetNotFound:
         sheet = wb.add_worksheet(title=SHEET_INVENTORY, rows=100, cols=INV_LAST_COL)
 
     sheet.update(
@@ -2194,6 +2534,11 @@ def apply_inventory_safety_formats(sheet, records: list[dict]):
         sheet.spreadsheet.batch_update({"requests": requests})
 
 def refresh_inventory(wb) -> dict:
+    with _sheet_write_lock:
+        return _refresh_inventory_locked(wb)
+
+
+def _refresh_inventory_locked(wb) -> dict:
     movements_added = sync_transaction_inventory_movements(wb)
     movement_sheet = get_or_create_inventory_movement_sheet(wb)
     sort_inventory_movement_sheet(movement_sheet)
@@ -2744,29 +3089,48 @@ HELP_TEXT = """溫室帳目機器人
 30天內可輸入：恢復 TX-0025"""
 
 def refresh_receivables_job() -> dict:
-    wb = get_workbook()
-    tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
-    sheet = wb.worksheet(SHEET_RECEIVABLES)
-    ids_added = ensure_transaction_ids(tx_sheet)
-    purged_transactions = purge_soft_deleted_rows(tx_sheet, COL_DELETED_AT)
-    purged_receivables = purge_soft_deleted_rows(sheet, RECV_COL_DELETED_AT)
-    sort_sheet_by_date(tx_sheet, TX_LAST_COL)
-    refresh_transaction_formats(tx_sheet)
-    sort_sheet_by_date(sheet, RECV_LAST_COL)
-    refresh_receivable_overdue_formats(sheet)
-    refresh_receivable_totals(sheet)
-    refresh_customer_analysis(wb)
-    refresh_monthly_overview(wb)
-    inventory_result = refresh_inventory(wb)
-    return {
-        "ok": True,
-        "date": today_tw().strftime("%Y/%m/%d"),
-        "ids_added": ids_added,
-        "purged_transactions": purged_transactions,
-        "purged_receivables": purged_receivables,
-        "inventory_updated": inventory_result.get("updated", 0),
-        "inventory_movements_added": inventory_result.get("movements_added", 0),
-    }
+    with _sheet_write_lock:
+        wb = get_workbook()
+        tx_sheet = wb.worksheet(SHEET_TRANSACTIONS)
+        sheet = wb.worksheet(SHEET_RECEIVABLES)
+        event_sheet = get_or_create_webhook_event_sheet(wb)
+        ids_added = ensure_transaction_ids(tx_sheet, reserved_webhook_tx_ids(event_sheet))
+
+        # 先稽核、後整理。發現重複時不進行庫存與應收同步，避免錯誤擴大。
+        movement_sheet = get_or_create_inventory_movement_sheet(wb)
+        tx_duplicates = duplicate_transaction_ids(tx_sheet)
+        movement_duplicates = duplicate_movement_ids(movement_sheet)
+        if tx_duplicates or movement_duplicates:
+            return {
+                "ok": False,
+                "date": today_tw().strftime("%Y/%m/%d"),
+                "ids_added": ids_added,
+                "duplicate_tx_ids": tx_duplicates,
+                "duplicate_movement_ids": movement_duplicates,
+                "error": "發現重複編號，已停止整理以避免更新錯誤資料",
+            }
+
+        purged_transactions = purge_soft_deleted_rows(tx_sheet, COL_DELETED_AT)
+        purged_receivables = purge_soft_deleted_rows(sheet, RECV_COL_DELETED_AT)
+        sort_sheet_by_date(tx_sheet, TX_LAST_COL)
+        refresh_transaction_formats(tx_sheet)
+        sort_sheet_by_date(sheet, RECV_LAST_COL)
+        refresh_receivable_overdue_formats(sheet)
+        refresh_receivable_totals(sheet)
+        refresh_customer_analysis(wb)
+        refresh_monthly_overview(wb)
+        inventory_result = refresh_inventory(wb)
+        return {
+            "ok": True,
+            "date": today_tw().strftime("%Y/%m/%d"),
+            "ids_added": ids_added,
+            "purged_transactions": purged_transactions,
+            "purged_receivables": purged_receivables,
+            "inventory_updated": inventory_result.get("updated", 0),
+            "inventory_movements_added": inventory_result.get("movements_added", 0),
+            "duplicate_tx_ids": {},
+            "duplicate_movement_ids": {},
+        }
 
 # ══════════════════════════════════════════════════════════════
 # Flask 路由
@@ -2796,6 +3160,13 @@ def refresh_receivables_route():
 
     try:
         result = refresh_receivables_job()
+        if not result.get("ok"):
+            return {
+                "status": "duplicate_ids",
+                "error": result.get("error", "發現重複編號"),
+                "duplicate_tx_ids": result.get("duplicate_tx_ids", {}),
+                "duplicate_movement_ids": result.get("duplicate_movement_ids", {}),
+            }, 409
         return {
             "status": "ok",
             "date": result["date"],
@@ -2855,15 +3226,28 @@ def handle_message(event):
         elif user_text == "整理":
             try:
                 result = refresh_receivables_job()
-                reply = (
-                    "✅ 交易格式、帳款、庫存、月份總覽與客戶分析已整理\n"
-                    f"日期｜{result['date']}\n"
-                    f"補上交易編號｜{result.get('ids_added', 0)} 筆\n"
-                    f"移除逾期刪除交易｜{result.get('purged_transactions', 0)} 筆\n"
-                    f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆\n"
-                    f"補上庫存異動｜{result.get('inventory_movements_added', 0)} 筆\n"
-                    f"更新庫存品種｜{result.get('inventory_updated', 0)} 筆"
-                )
+                if not result.get("ok"):
+                    warning_lines = [
+                        "⚠️ 發現重複編號，已停止整理",
+                        "請先依列號修復，避免庫存或應收帳款連錯交易。",
+                    ]
+                    tx_duplicates = result.get("duplicate_tx_ids", {})
+                    movement_duplicates = result.get("duplicate_movement_ids", {})
+                    if tx_duplicates:
+                        warning_lines.append("交易編號｜" + duplicate_id_summary(tx_duplicates))
+                    if movement_duplicates:
+                        warning_lines.append("庫存異動｜" + duplicate_id_summary(movement_duplicates))
+                    reply = "\n".join(warning_lines)
+                else:
+                    reply = (
+                        "✅ 交易格式、帳款、庫存、月份總覽與客戶分析已整理\n"
+                        f"日期｜{result['date']}\n"
+                        f"補上交易編號｜{result.get('ids_added', 0)} 筆\n"
+                        f"移除逾期刪除交易｜{result.get('purged_transactions', 0)} 筆\n"
+                        f"移除逾期刪除應收｜{result.get('purged_receivables', 0)} 筆\n"
+                        f"補上庫存異動｜{result.get('inventory_movements_added', 0)} 筆\n"
+                        f"更新庫存品種｜{result.get('inventory_updated', 0)} 筆"
+                    )
             except Exception:
                 logger.exception("Manual receivables refresh failed")
                 reply = "⚠️ 整理失敗，請稍後再試。"
@@ -2973,10 +3357,7 @@ def handle_message(event):
                     logger.exception("Delete failed")
                     reply = "⚠️ 刪除失敗，請稍後再試。"
 
-        # ── 新增交易（防重複） ──────────────────────────────────
-        elif has_seen_message(message_id):
-            reply = "這則訊息已經處理過，沒有重複寫入。"
-
+        # ── 新增交易（永久防重複） ──────────────────────────────
         else:
             parsed = parse_message(user_text)
             if parsed is None:
@@ -2997,9 +3378,16 @@ def handle_message(event):
                 )
             else:
                 try:
-                    wb      = get_workbook()
-                    row_num, tx_id = append_transaction(wb, parsed)
-                    remember_message(message_id)
+                    wb = get_workbook()
+                    event_key, webhook_id, persistent_message_id = webhook_event_identity(event)
+                    row_num, tx_id, was_duplicate = append_transaction_for_event(
+                        wb,
+                        parsed,
+                        event_key,
+                        webhook_id,
+                        persistent_message_id,
+                        getattr(event.source, "user_id", ""),
+                    )
                 except Exception:
                     logger.exception("Failed to append transaction")
                     reply = "⚠️ 寫入交易記錄時發生錯誤，請稍後再試。"
@@ -3020,13 +3408,28 @@ def handle_message(event):
                         movement_err = True
                         logger.exception("Failed to append automatic inventory movement")
 
-                    reply = format_new_transaction_reply(parsed, tx_id, recv_added)
+                    if was_duplicate:
+                        reply = (
+                            "✅ 這則 LINE 事件已處理過，沒有重複寫入。\n"
+                            f"交易編號｜{tx_id}"
+                        )
+                    else:
+                        reply = format_new_transaction_reply(parsed, tx_id, recv_added)
                     if recv_err:
                         reply += "\n⚠️ 交易已記錄，但應收帳款同步失敗。"
                     if movement_result.get("added"):
                         reply += f"\n📎 已同步庫存異動 {movement_result['movement_id']}"
                     if movement_err:
                         reply += "\n⚠️ 交易已記錄，但庫存異動同步失敗。"
+                    try:
+                        if not recv_err and not movement_err:
+                            set_webhook_event_status(
+                                wb, event_key, EVENT_STATUS_COMPLETED, tx_id
+                            )
+                    except Exception:
+                        logger.exception("Failed to finalize webhook deduplication record")
+                        reply += "\n⚠️ 防重紀錄未完成，請先勿重送相同訊息。"
+                    remember_message(message_id)
 
         line_api.reply_message(
             ReplyMessageRequest(
